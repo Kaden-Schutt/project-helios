@@ -1,0 +1,27 @@
+{
+  "timestamp": "20260309_163915",
+  "server_url": "http://localhost:5750/query",
+  "summary": {
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0
+  },
+  "scenarios": [
+    {
+      "scenario": "crosswalk_timer",
+      "name": "Crosswalk \u2014 Countdown Timer",
+      "image": "crosswalk_timer.jpg",
+      "results": [
+        {
+          "query": "Is it safe to cross the street?",
+          "response": "No, it is not safe to cross. The pedestrian signal shows a red hand, indicating you must wait.",
+          "expects": [],
+          "matched": [],
+          "passed": true,
+          "server_ms": "3647",
+          "turn": "1"
+        }
+      ]
+    }
+  ]
+}

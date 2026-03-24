@@ -1,0 +1,209 @@
+{
+  "timestamp": "20260309_163427",
+  "server_url": "http://localhost:5750/query",
+  "summary": {
+    "passed": 8,
+    "failed": 1,
+    "skipped": 0
+  },
+  "scenarios": [
+    {
+      "scenario": "crosswalk_safe",
+      "name": "Crosswalk \u2014 Walk Signal",
+      "image": "crosswalk_walk.jpg",
+      "results": [
+        {
+          "query": "Is it safe to cross the street?",
+          "response": "The pedestrian signal is showing the white walking figure, which indicates that it is safe to cross. Please remain alert for turning vehicles as you proceed.",
+          "expects": [
+            "safe",
+            "walk",
+            "cross",
+            "go",
+            "yes"
+          ],
+          "matched": [
+            "safe",
+            "walk",
+            "cross"
+          ],
+          "passed": true,
+          "server_ms": "4752",
+          "turn": "1"
+        }
+      ]
+    },
+    {
+      "scenario": "crosswalk_unsafe",
+      "name": "Crosswalk \u2014 Stop Signal",
+      "image": "crosswalk_stop.jpg",
+      "results": [
+        {
+          "query": "Is it safe to cross the street?",
+          "response": "Do not cross the street. The pedestrian signal is currently showing a red hand, which means you must wait.",
+          "expects": [
+            "stop",
+            "wait",
+            "don't",
+            "no",
+            "hand",
+            "not safe"
+          ],
+          "matched": [
+            "wait",
+            "no",
+            "hand"
+          ],
+          "passed": true,
+          "server_ms": "4295",
+          "turn": "1"
+        }
+      ]
+    },
+    {
+      "scenario": "menu_reading",
+      "name": "Restaurant Menu \u2014 Read & Follow-up",
+      "image": "menu_board.jpg",
+      "results": [
+        {
+          "query": "What's on the menu?",
+          "response": "This is an In-N-Out menu. Combo meals start at $8.40 for a hamburger, $8.90 for a cheeseburger, and $10.75 for a Double-Double. Individual items include a Double-Double for $6.10, a Cheeseburger for $4.25, a Hamburger for $3.75, and fries for $2.35.",
+          "expects": [
+            "burger",
+            "fries",
+            "drink",
+            "combo",
+            "meal",
+            "chicken",
+            "sandwich"
+          ],
+          "matched": [
+            "burger",
+            "fries",
+            "combo",
+            "meal"
+          ],
+          "passed": true,
+          "server_ms": "8643",
+          "turn": "1"
+        },
+        {
+          "query": "What's the cheapest item?",
+          "response": "The cheapest item is milk, which costs 99 cents.",
+          "expects": [
+            "$",
+            "cheapest",
+            "least",
+            "lowest"
+          ],
+          "matched": [
+            "cheapest"
+          ],
+          "passed": true,
+          "server_ms": "3733",
+          "turn": "2"
+        }
+      ]
+    },
+    {
+      "scenario": "navigation_door",
+      "name": "Indoor Navigation \u2014 Find Exit",
+      "image": "hallway_door.jpg",
+      "results": [
+        {
+          "query": "Where is the exit?",
+          "response": "The exit is located at the far end of the hallway, straight ahead of you. It appears to be a door positioned centrally at the end of this corridor.",
+          "expects": [
+            "door",
+            "left",
+            "right",
+            "ahead",
+            "straight",
+            "exit"
+          ],
+          "matched": [
+            "door",
+            "ahead",
+            "straight",
+            "exit"
+          ],
+          "passed": true,
+          "server_ms": "3927",
+          "turn": "1"
+        },
+        {
+          "query": "Is there anything blocking the path?",
+          "response": "The path ahead appears clear. There is a table to your immediate left, but the center of the hallway is unobstructed as you walk toward the exit.",
+          "expects": [],
+          "matched": [],
+          "passed": true,
+          "server_ms": "3488",
+          "turn": "2"
+        }
+      ]
+    },
+    {
+      "scenario": "crowded_space",
+      "name": "Crowded Space \u2014 Obstacle Detection",
+      "image": "crowded_space.jpg",
+      "results": [
+        {
+          "query": "Is anything in my way?",
+          "response": "You are standing on an elevated walkway with metal railings on either side. The path ahead is clear, but please be aware of nearby stairs and escalator entrances to your left.",
+          "expects": [
+            "people",
+            "person",
+            "crowd",
+            "table",
+            "chair",
+            "obstacle"
+          ],
+          "matched": [],
+          "passed": false,
+          "server_ms": "5465",
+          "turn": "1"
+        },
+        {
+          "query": "Which direction has the most open space?",
+          "response": "The most open space is directly in front of you on the level you are currently on. Proceeding straight ahead will lead you toward the open walkway area, which is less crowded than the surrounding food court levels.",
+          "expects": [
+            "left",
+            "right",
+            "ahead",
+            "behind",
+            "forward"
+          ],
+          "matched": [
+            "ahead"
+          ],
+          "passed": true,
+          "server_ms": "4867",
+          "turn": "2"
+        }
+      ]
+    },
+    {
+      "scenario": "grocery_aisle",
+      "name": "Grocery Store \u2014 Section Identification",
+      "image": "grocery_aisle.jpg",
+      "results": [
+        {
+          "query": "What section of the store am I in?",
+          "response": "You are in the breakfast aisle. There are signs indicating that this area also includes selections for tea, coffee, and biscuits.",
+          "expects": [
+            "aisle",
+            "section",
+            "shelf",
+            "shelves"
+          ],
+          "matched": [
+            "aisle"
+          ],
+          "passed": true,
+          "server_ms": "3856",
+          "turn": "1"
+        }
+      ]
+    }
+  ]
+}

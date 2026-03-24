@@ -1,0 +1,15 @@
+# Helios Test Bench dependencies
+# Install: pip install -r requirements.txt
+
+# Server (Pi-side)
+fastapi>=0.100.0
+uvicorn>=0.23.0
+httpx>=0.24.0
+websockets>=11.0
+python-dotenv>=1.0.0
+
+# Client (ESP32 simulator)
+requests>=2.31.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+pynput>=1.7.6
