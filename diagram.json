@@ -7,10 +7,64 @@
       "type": "board-xiao-esp32-s3",
       "id": "xiao",
       "top": 0,
-      "left": 0,
+      "left": 200,
       "attrs": {}
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultrasonic-left",
+      "top": -160,
+      "left": 40,
+      "attrs": { "distance": "50" }
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultrasonic-right",
+      "top": -160,
+      "left": 360,
+      "attrs": { "distance": "50" }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer-left",
+      "top": 220,
+      "left": 60,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer-right",
+      "top": 220,
+      "left": 400,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn",
+      "top": 220,
+      "left": 230,
+      "attrs": { "color": "red" }
     }
   ],
-  "connections": [],
+  "connections": [
+    ["xiao:D0", "ultrasonic-left:TRIG", "green", ["v0"]],
+    ["xiao:D1", "ultrasonic-left:ECHO", "blue", ["v0"]],
+    ["ultrasonic-left:VCC", "xiao:3V3", "red", ["v0"]],
+    ["ultrasonic-left:GND", "xiao:GND", "black", ["v0"]],
+
+    ["xiao:D8", "ultrasonic-right:TRIG", "green", ["v0"]],
+    ["xiao:D9", "ultrasonic-right:ECHO", "blue", ["v0"]],
+    ["ultrasonic-right:VCC", "xiao:3V3", "red", ["v0"]],
+    ["ultrasonic-right:GND", "xiao:GND", "black", ["v0"]],
+
+    ["xiao:D2", "buzzer-left:1", "orange", ["v0"]],
+    ["buzzer-left:2", "xiao:GND", "black", ["v0"]],
+
+    ["xiao:D10", "buzzer-right:1", "orange", ["v0"]],
+    ["buzzer-right:2", "xiao:GND", "black", ["v0"]],
+
+    ["btn:1.l", "xiao:D3", "purple", ["v0"]],
+    ["btn:2.l", "xiao:GND", "black", ["v0"]]
+  ],
   "dependencies": {}
 }
