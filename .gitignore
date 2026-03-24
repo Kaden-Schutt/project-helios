@@ -5,3 +5,8 @@ __pycache__/
 .vscode/
 firmware/.cache/
 firmware/.pio/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/compile_commands.json
+firmware/CMakeLists.txt
+output/
