@@ -28,7 +28,13 @@ Each team member has their own isolated workspace with:
 | **GitDoc** | Auto-commits your changes on save — no git commands needed |
 | **Wokwi** | Circuit simulator — test the Safety Loop without real hardware |
 
-**First run note:** If Claude Code doesn't appear in the sidebar, disable and re-enable the extension once (Extensions panel → Claude Code → Disable → Enable). This only needs to be done the first time.
+**First run note:** If Claude Code shows a login prompt or doesn't appear in the sidebar:
+1. Go to Extensions panel (Ctrl+Shift+X)
+2. Find Claude Code → click **Disable**
+3. Reload the page (F5 or browser refresh)
+4. Go back to Extensions → click **Enable**
+
+This only needs to be done once. After that it works automatically.
 
 ### Pre-installed Tools (Terminal)
 
