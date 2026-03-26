@@ -1,12 +1,8 @@
 /*
- * Helios Firmware — Peripheral Test
- * ==================================
- * Minimal test firmware for XIAO ESP32S3 Sense.
- * Initializes camera + mic, captures one frame and a short audio clip,
- * dumps stats over USB serial. No WiFi, no speaker — just hardware validation.
- *
- * Build:  idf.py build
- * Flash:  idf.py -p /dev/cu.usbmodem1101 flash monitor
+ * Helios Firmware — BLE Voice Assistant
+ * =======================================
+ * Button hold → mic records to SD → BLE sends PCM to Pi
+ * Pi runs STT→LLM→TTS → BLE sends TTS back → speaker plays
  */
 
 #include <stdio.h>
@@ -14,238 +10,261 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
 #include "esp_psram.h"
-#include "mbedtls/base64.h"
+#include "esp_heap_caps.h"
 #include "driver/gpio.h"
 
 #include "helios.h"
 
 static const char *TAG = "helios";
 
-// Button GPIO — user will wire a physical button here
-// Change this to whichever GPIO the button is wired to
-#define BUTTON_GPIO     GPIO_NUM_1   // D0 on XIAO header
-#define BUTTON_ACTIVE   1            // Active high (button module with pull-down)
+#define BUTTON_GPIO     GPIO_NUM_4
 
-static void print_sysinfo(void)
-{
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
+// TTS receive buffer (256KB in PSRAM, ~8s at 24kHz 16-bit)
+#define TTS_BUF_SIZE    (256 * 1024)
+static uint8_t *tts_buf = NULL;
+static volatile size_t tts_received = 0;
+static volatile size_t tts_expected = 0;
+static volatile bool tts_done = false;
+static SemaphoreHandle_t tts_sem = NULL;
 
-    printf("\n");
-    printf("========================================\n");
-    printf("  HELIOS PERIPHERAL TEST\n");
-    printf("========================================\n");
-    printf("  Chip:    ESP32-S3 rev %d.%d, %d cores @ 240MHz\n",
-           chip.revision / 100, chip.revision % 100, chip.cores);
-    uint32_t flash_size = 0;
-    esp_flash_get_size(NULL, &flash_size);
-    printf("  Flash:   %lu MB\n", (unsigned long)(flash_size / (1024 * 1024)));
-    printf("  PSRAM:   %lu KB free\n", (unsigned long)(esp_psram_get_size() / 1024));
-    printf("  Heap:    %lu KB free\n", (unsigned long)(esp_get_free_heap_size() / 1024));
-    printf("  Button:  GPIO %d (active %s)\n", BUTTON_GPIO, BUTTON_ACTIVE ? "high" : "low");
-    printf("========================================\n\n");
-}
+// Config
+static helios_config_t cfg;
+static int button_idle_level = 0;
 
+// --- Button ---
 static void button_init(void)
 {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,  // Module has its own pull-down
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
-    ESP_LOGI(TAG, "button on GPIO %d ready (pull-up, active low)", BUTTON_GPIO);
 }
 
 static bool button_pressed(void)
 {
-    return gpio_get_level(BUTTON_GPIO) == BUTTON_ACTIVE;
+    return gpio_get_level(BUTTON_GPIO) != button_idle_level;
 }
 
-static void test_camera(void)
+// --- BLE Callbacks ---
+static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is_last)
 {
-    ESP_LOGI(TAG, "--- CAMERA TEST ---");
+    if (is_first && len >= 4) {
+        tts_expected = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+        tts_received = 0;
+        tts_done = false;
+        ESP_LOGI(TAG, "TTS incoming: %zu bytes (%.1fs)",
+                 tts_expected, (float)tts_expected / (SPK_SAMPLE_RATE * 2));
+        data += 4;
+        len -= 4;
+    }
 
-    uint8_t *jpeg_buf = NULL;
-    size_t jpeg_len = 0;
-
-    esp_err_t err = camera_capture_jpeg(&jpeg_buf, &jpeg_len);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "CAMERA TEST FAILED");
+    if (is_last) {
+        tts_done = true;
+        xSemaphoreGive(tts_sem);
         return;
     }
 
-    // Print JPEG header bytes for sanity check (should start with FF D8)
-    if (jpeg_len >= 2) {
-        printf("  JPEG header: %02X %02X (expect FF D8)\n", jpeg_buf[0], jpeg_buf[1]);
+    if (tts_buf && len > 0 && tts_received + len <= TTS_BUF_SIZE) {
+        memcpy(tts_buf + tts_received, data, len);
+        tts_received += len;
     }
-    printf("  JPEG size:   %zu bytes (%.1f KB)\n", jpeg_len, jpeg_len / 1024.0f);
-    printf("  CAMERA TEST: PASS\n\n");
 
-    camera_return_fb();
+    if (tts_received >= tts_expected && tts_expected > 0) {
+        tts_done = true;
+        xSemaphoreGive(tts_sem);
+    }
 }
 
-static void test_mic(void)
+static void on_control(uint8_t cmd, const uint8_t *payload, size_t payload_len)
 {
-    ESP_LOGI(TAG, "--- MIC TEST (1 second) ---");
-
-    uint8_t *pcm_buf = NULL;
-    size_t pcm_len = 0;
-
-    esp_err_t err = mic_record(1000, &pcm_buf, &pcm_len);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "MIC TEST FAILED");
-        return;
+    switch (cmd) {
+    case BLE_CMD_CONNECTED:
+        ESP_LOGI(TAG, "Pi connected");
+        break;
+    case BLE_CMD_PROCESSING:
+        ESP_LOGI(TAG, "Pi processing...");
+        break;
+    case BLE_CMD_SET_VOLUME:
+        if (payload_len >= 1) {
+            speaker_set_volume(payload[0]);
+            cfg.speaker_volume = payload[0];
+            config_save(&cfg);
+        }
+        break;
+    case BLE_CMD_ERROR:
+        ESP_LOGW(TAG, "Pi error: %.*s", (int)payload_len, (const char *)payload);
+        break;
     }
-
-    // Check if we got actual audio (not all zeros)
-    int16_t *samples = (int16_t *)pcm_buf;
-    size_t n_samples = pcm_len / 2;
-    int32_t peak = 0;
-    int64_t sum = 0;
-
-    for (size_t i = 0; i < n_samples; i++) {
-        int32_t val = samples[i] < 0 ? -samples[i] : samples[i];
-        if (val > peak) peak = val;
-        sum += val;
-    }
-
-    int32_t avg = (int32_t)(sum / n_samples);
-
-    printf("  PCM size:    %zu bytes (%zu samples)\n", pcm_len, n_samples);
-    printf("  Peak level:  %ld / 32767\n", (long)peak);
-    printf("  Avg level:   %ld\n", (long)avg);
-
-    if (peak > 100) {
-        printf("  MIC TEST:    PASS (signal detected)\n\n");
-    } else {
-        printf("  MIC TEST:    WARN (very low signal — check mic connection)\n\n");
-    }
-
-    mic_free_buf(pcm_buf);
 }
 
 void app_main(void)
 {
-    print_sysinfo();
+    printf("\n========================================\n");
+    printf("  HELIOS — BLE Voice Assistant\n");
+    printf("========================================\n\n");
 
     // Init peripherals
-    ESP_LOGI(TAG, "Initializing camera...");
-    esp_err_t cam_ok = camera_init();
-
-    ESP_LOGI(TAG, "Initializing microphone...");
+    ESP_LOGI(TAG, "Initializing mic...");
     esp_err_t mic_ok = mic_init();
 
-    // Init button
+    ESP_LOGI(TAG, "Initializing speaker...");
+    esp_err_t spk_ok = speaker_init();
+
+    ESP_LOGI(TAG, "Initializing SD card...");
+    esp_err_t sd_ok = sdcard_init();
+
+    // Load config
+    if (sd_ok == ESP_OK) {
+        config_load(&cfg);
+    } else {
+        config_defaults(&cfg);
+    }
+    if (spk_ok == ESP_OK) speaker_set_volume(cfg.speaker_volume);
+
     button_init();
 
-    printf("\n");
-    printf("  Camera: %s\n", cam_ok == ESP_OK ? "OK" : "FAILED");
-    printf("  Mic:    %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
-    printf("\n");
+    // Init BLE
+    tts_sem = xSemaphoreCreateBinary();
+    tts_buf = heap_caps_malloc(TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
 
-    // Run peripheral tests once on boot
-    if (cam_ok == ESP_OK) {
-        test_camera();
-    }
+    ESP_LOGI(TAG, "Initializing BLE...");
+    esp_err_t ble_ok = ble_init(on_tts_chunk, on_control);
+
+    printf("  Mic:     %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  Speaker: %s\n", spk_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  SD Card: %s\n", sd_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  TTS buf: %s\n", tts_buf ? "OK (256KB PSRAM)" : "FAILED");
+    printf("  Volume:  %d%%\n", cfg.speaker_volume);
+    printf("  Heap:    %lu KB free\n\n", (unsigned long)(esp_get_free_heap_size() / 1024));
+
+    // Quick mic test
     if (mic_ok == ESP_OK) {
-        test_mic();
+        uint8_t *test_pcm = NULL;
+        size_t test_len = 0;
+        if (mic_record(500, &test_pcm, &test_len) == ESP_OK) {
+            int16_t *samples = (int16_t *)test_pcm;
+            int32_t peak = 0;
+            for (size_t i = 0; i < test_len / 2; i++) {
+                int32_t v = samples[i] < 0 ? -samples[i] : samples[i];
+                if (v > peak) peak = v;
+            }
+            printf("  Mic test: peak=%ld %s\n", (long)peak, peak > 100 ? "OK" : "WARN");
+            mic_free_buf(test_pcm);
+        }
     }
 
-    // Print heap after init
-    printf("  Heap after init: %lu KB free\n\n", (unsigned long)(esp_get_free_heap_size() / 1024));
-
-    // Main loop — button press triggers capture + record
-    printf("  Press button (GPIO %d) to capture photo + record 2s audio\n", BUTTON_GPIO);
-    printf("  Output is printed over USB serial.\n\n");
-
-    while (1) {
-        if (button_pressed()) {
-            // Debounce
+    // Auto-detect button idle level (or use saved)
+    if (cfg.button_idle_level >= 0) {
+        button_idle_level = cfg.button_idle_level;
+        ESP_LOGI(TAG, "Button idle level from config: %d", button_idle_level);
+    } else {
+        ESP_LOGI(TAG, "Auto-detecting button...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        int high = 0;
+        for (int i = 0; i < 10; i++) {
+            high += gpio_get_level(BUTTON_GPIO);
             vTaskDelay(pdMS_TO_TICKS(50));
-            if (!button_pressed()) {
-                continue;  // glitch
-            }
+        }
+        button_idle_level = (high >= 5) ? 1 : 0;
+        cfg.button_idle_level = button_idle_level;
+        if (sd_ok == ESP_OK) config_save(&cfg);
+    }
 
-            printf("\n>>> BUTTON PRESSED — capturing...\n\n");
+    printf("\n  Waiting for BLE connection...\n");
+    while (!ble_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    // Give BLE stack time to finish service discovery + subscription
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    printf("  Connected! Hold button to talk.\n\n");
 
-            uint8_t *jpeg_buf = NULL;
-            size_t jpeg_len = 0;
-            uint8_t *pcm_buf = NULL;
-            size_t pcm_len = 0;
-
-            // Camera capture
-            if (cam_ok == ESP_OK) {
-                if (camera_capture_jpeg(&jpeg_buf, &jpeg_len) == ESP_OK) {
-                    printf("  Photo: %zu bytes JPEG (%.1f KB)\n", jpeg_len, jpeg_len / 1024.0f);
-                }
-            }
-
-            // Mic record
-            if (mic_ok == ESP_OK) {
-                printf("  Recording 2s...\n");
-                mic_record(2000, &pcm_buf, &pcm_len);
-            }
-
-            printf("  Heap: %lu KB free\n", (unsigned long)(esp_get_free_heap_size() / 1024));
-
-            // Send data as base64 text lines — avoids binary-over-serial issues
-            //   HELIOS_JPEG:<base64 encoded jpeg>\n
-            //   HELIOS_PCM:<base64 encoded pcm>\n
-            //   HELIOS_END\n
-            if (jpeg_buf && jpeg_len > 0) {
-                // Base64 encode JPEG
-                size_t b64_len = 0;
-                unsigned char *b64_buf = NULL;
-                mbedtls_base64_encode(NULL, 0, &b64_len, jpeg_buf, jpeg_len);
-                b64_buf = malloc(b64_len);
-                if (b64_buf) {
-                    mbedtls_base64_encode(b64_buf, b64_len, &b64_len, jpeg_buf, jpeg_len);
-                    printf("HELIOS_JPEG:");
-                    fwrite(b64_buf, 1, b64_len, stdout);
-                    printf("\n");
-                    fflush(stdout);
-                    free(b64_buf);
-                }
-
-                // Base64 encode PCM
-                if (pcm_buf && pcm_len > 0) {
-                    b64_len = 0;
-                    mbedtls_base64_encode(NULL, 0, &b64_len, pcm_buf, pcm_len);
-                    b64_buf = malloc(b64_len);
-                    if (b64_buf) {
-                        mbedtls_base64_encode(b64_buf, b64_len, &b64_len, pcm_buf, pcm_len);
-                        printf("HELIOS_PCM:");
-                        fwrite(b64_buf, 1, b64_len, stdout);
-                        printf("\n");
-                        fflush(stdout);
-                        free(b64_buf);
-                    }
-                }
-
-                printf("HELIOS_END\n");
-                fflush(stdout);
-            }
-
-            if (jpeg_buf) camera_return_fb();
-            if (pcm_buf) mic_free_buf(pcm_buf);
-
-            printf(">>> DONE\n");
-
-            // Wait for button release
-            while (button_pressed()) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));  // debounce on release
+    // --- Main voice loop ---
+    while (1) {
+        if (!ble_is_connected()) {
+            printf("  BLE disconnected. Waiting...\n");
+            while (!ble_is_connected()) vTaskDelay(pdMS_TO_TICKS(500));
+            printf("  Reconnected!\n\n");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));  // poll at 50Hz
+        if (button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (!button_pressed()) goto poll;
+
+            ESP_LOGI(TAG, "LISTENING...");
+            esp_err_t nrc = ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
+            ESP_LOGI(TAG, "Button notify: %d", nrc);
+
+            // Record mic
+            size_t pcm_len = 0;
+            bool used_sd = false;
+
+            if (mic_ok == ESP_OK) {
+                if (sd_ok == ESP_OK) {
+                    mic_record_to_file(button_pressed, 30000,
+                                       SD_MOUNT_POINT "/mic.pcm", &pcm_len);
+                    used_sd = true;
+                } else {
+                    uint8_t *pcm_buf = NULL;
+                    mic_record_while(button_pressed, 30000, &pcm_buf, &pcm_len);
+                    if (pcm_buf) {
+                        // Send from PSRAM
+                        ESP_LOGI(TAG, "Sending %zu bytes mic over BLE...", pcm_len);
+                        ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
+                        ble_send_mic_data(pcm_buf, pcm_len);
+                        mic_free_buf(pcm_buf);
+                        goto wait_tts;
+                    }
+                }
+            }
+
+            if (pcm_len == 0) {
+                ESP_LOGW(TAG, "No audio recorded");
+                goto poll;
+            }
+
+            ESP_LOGI(TAG, "Recorded %.1fs", (float)pcm_len / (MIC_SAMPLE_RATE * 2));
+            ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
+
+            // Send mic data over BLE
+            if (used_sd) {
+                ESP_LOGI(TAG, "Sending %zu bytes mic over BLE...", pcm_len);
+                ble_send_mic_data_from_file(SD_MOUNT_POINT "/mic.pcm", pcm_len);
+            }
+
+wait_tts:
+            // Wait for TTS response (30s timeout)
+            ESP_LOGI(TAG, "Waiting for TTS...");
+            tts_received = 0;
+            tts_expected = 0;
+            tts_done = false;
+
+            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(30000)) == pdTRUE && tts_received > 0) {
+                ESP_LOGI(TAG, "Playing TTS (%zu bytes, %.1fs)...",
+                         tts_received, (float)tts_received / (SPK_SAMPLE_RATE * 2));
+                if (spk_ok == ESP_OK) {
+                    speaker_play(tts_buf, tts_received);
+                }
+                ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
+                ESP_LOGI(TAG, "Done.");
+            } else {
+                ESP_LOGW(TAG, "No TTS received (timeout)");
+            }
+
+            // Wait for button release
+            while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+poll:
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

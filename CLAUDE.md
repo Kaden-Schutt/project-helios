@@ -44,9 +44,9 @@ A wearable assistive device for vision-impaired individuals. Two physical units 
 | Pin | Function |
 |-----|----------|
 | D3/GPIO4 | Push button OUT |
-| D5/GPIO6 | MAX98357A LRC |
+| D4/GPIO5 | MAX98357A LRC |
+| D5/GPIO6 | MAX98357A BCLK |
 | D6/GPIO43 | MAX98357A DIN |
-| D7/GPIO44 | MAX98357A BCLK |
 | Camera/Mic | Built into Sense expansion board |
 
 ## Codebase
