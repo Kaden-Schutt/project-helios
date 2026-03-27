@@ -16,6 +16,27 @@
 
 static const char *TAG = "ble";
 
+// µ-law encode: 16-bit signed PCM → 8-bit µ-law
+static uint8_t pcm_to_ulaw(int16_t sample)
+{
+    const int BIAS = 0x84;
+    const int MAX = 0x7FFF;
+    int sign, exponent, mantissa;
+    uint8_t ulawbyte;
+
+    sign = (sample >> 8) & 0x80;
+    if (sign) sample = -sample;
+    if (sample > MAX) sample = MAX;
+    sample += BIAS;
+
+    exponent = 7;
+    for (int expMask = 0x4000; (sample & expMask) == 0 && exponent > 0; exponent--, expMask >>= 1) {}
+
+    mantissa = (sample >> (exponent + 3)) & 0x0F;
+    ulawbyte = ~(sign | (exponent << 4) | mantissa);
+    return ulawbyte;
+}
+
 // --- State ---
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_mic_chr_handle;
@@ -117,7 +138,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
             {
                 .uuid = &spk_uuid.u,
                 .access_cb = spk_chr_access,
-                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE,
             },
             {
                 .uuid = &ctrl_uuid.u,
@@ -358,53 +379,87 @@ esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len)
     FILE *f = fopen(path, "rb");
     if (!f) return ESP_FAIL;
 
-    // Send 4-byte size header
+    // µ-law encoded size = half of original (16-bit → 8-bit)
+    size_t ulaw_total = file_len / 2;
+
+    // Send 4-byte size header with µ-law encoded size
     uint8_t hdr[4] = {
-        (file_len >>  0) & 0xFF, (file_len >>  8) & 0xFF,
-        (file_len >> 16) & 0xFF, (file_len >> 24) & 0xFF,
+        (ulaw_total >>  0) & 0xFF, (ulaw_total >>  8) & 0xFF,
+        (ulaw_total >> 16) & 0xFF, (ulaw_total >> 24) & 0xFF,
     };
     struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 4);
     if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
 
-    // Read file and send in chunks
-    uint8_t chunk_buf[BLE_CHUNK_SIZE];
+    // Read 16kHz s16le from file, µ-law encode to 8-bit, send over BLE
+    uint8_t read_buf[1024];           // 512 samples of s16le
+    uint8_t send_buf[BLE_CHUNK_SIZE];
+    size_t send_pos = 0;
     size_t sent = 0;
-    while (sent < file_len) {
-        size_t to_read = file_len - sent;
-        if (to_read > BLE_CHUNK_SIZE) to_read = BLE_CHUNK_SIZE;
-        size_t n = fread(chunk_buf, 1, to_read, f);
+    size_t file_read = 0;
+
+    while (file_read < file_len) {
+        size_t to_read = file_len - file_read;
+        if (to_read > sizeof(read_buf)) to_read = sizeof(read_buf);
+        to_read &= ~1;  // align to sample boundary
+        size_t n = fread(read_buf, 1, to_read, f);
         if (n == 0) break;
+        file_read += n;
 
-        // Retry loop for this chunk
-        int retries = 0;
-        while (retries < 50) {
-            om = ble_hs_mbuf_from_flat(chunk_buf, n);
-            if (!om) { vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue; }
+        // µ-law encode with DC offset removal: 2 bytes in → 1 byte out
+        int16_t *samples = (int16_t *)read_buf;
+        size_t n_samples = n / 2;
+        // Compute DC offset of this chunk
+        int32_t sum = 0;
+        for (size_t i = 0; i < n_samples; i++) sum += samples[i];
+        int16_t dc = (int16_t)(sum / (int32_t)n_samples);
 
-            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == 0) break;  // success
+        for (size_t i = 0; i < n_samples; i++) {
+            int16_t centered = samples[i] - dc;
+            send_buf[send_pos++] = pcm_to_ulaw(centered);
 
-            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                vTaskDelay(pdMS_TO_TICKS(20));
-                retries++;
-                continue;
+            if (send_pos >= BLE_CHUNK_SIZE) {
+                int retries = 0;
+                while (retries < 50) {
+                    om = ble_hs_mbuf_from_flat(send_buf, send_pos);
+                    if (!om) { vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue; }
+                    int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+                    if (rc == 0) break;
+                    if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                        vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue;
+                    }
+                    ESP_LOGW(TAG, "Notify error at %zu: %d", sent, rc);
+                    break;
+                }
+                sent += send_pos;
+                send_pos = 0;
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
-            ESP_LOGW(TAG, "Notify error at %zu: %d", sent, rc);
-            break;
         }
-        sent += n;
-
-        // Pace: yield every chunk to let BLE stack transmit
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    // Wait for BLE stack to flush, then send end marker
+    // Flush remaining
+    if (send_pos > 0) {
+        int retries = 0;
+        while (retries < 50) {
+            om = ble_hs_mbuf_from_flat(send_buf, send_pos);
+            if (!om) { vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue; }
+            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+            if (rc == 0) break;
+            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue;
+            }
+            break;
+        }
+        sent += send_pos;
+    }
+
+    // End marker
     vTaskDelay(pdMS_TO_TICKS(100));
     om = ble_hs_mbuf_from_flat(NULL, 0);
     if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
 
     fclose(f);
-    ESP_LOGI(TAG, "Sent %zu bytes mic PCM from %s", sent, path);
+    ESP_LOGI(TAG, "Sent %zu bytes µ-law (from %zu bytes PCM) from %s", sent, file_len, path);
     return ESP_OK;
 }
 

@@ -15,6 +15,11 @@ import os
 import json
 import logging
 import base64
+import numpy as np
+
+# Ensure libopus can be found on macOS (Homebrew)
+if os.path.exists("/opt/homebrew/lib"):
+    os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")
 
 from bleak import BleakClient, BleakScanner
 from dotenv import load_dotenv
@@ -28,11 +33,11 @@ CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 STT_MODEL = "ink-whisper"
-STT_SAMPLE_RATE = 16000
+STT_SAMPLE_RATE = 16000  # Mic arrives as µ-law 8-bit @ 16kHz, decoded to s16le for STT
 
 TTS_MODEL = "sonic-3-2026-01-12"
 TTS_VOICE_ID = os.getenv("TTS_VOICE_ID", "f786b574-daa5-4673-aa0c-cbe3e8534c02")
-TTS_SAMPLE_RATE = 24000  # Match ESP32 speaker sample rate
+TTS_SAMPLE_RATE = 24000  # Matches ESP speaker; Opus compresses regardless of rate
 CARTESIA_VERSION = "2026-01-12"
 
 LLM_MODEL = "google/gemini-3.1-flash-lite-preview:nitro"
@@ -68,6 +73,87 @@ log = logging.getLogger("helios")
 # --- Pipeline (reused from server_nocam.py) ---
 
 conversation = {"history": [], "last_time": 0.0}
+
+
+def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
+    """Decode µ-law 8-bit to signed 16-bit PCM. Builds a 256-entry lookup table."""
+    # Build decode table once
+    table = np.zeros(256, dtype=np.int16)
+    for i in range(256):
+        s = ~i & 0xFF
+        sign = s & 0x80
+        exponent = (s >> 4) & 0x07
+        mantissa = s & 0x0F
+        val = ((mantissa << 4) | 0x84) << exponent
+        val -= 0x84
+        table[i] = -val if sign else val
+
+    indices = np.frombuffer(ulaw_data, dtype=np.uint8)
+    return table[indices].tobytes()
+
+
+def pcm_to_opus(pcm_s16: bytes, sample_rate: int = 16000) -> bytes:
+    """Encode s16le PCM to length-prefixed Opus frames for ESP32 playback."""
+    try:
+        import opuslib
+    except ImportError:
+        log.error("opuslib not installed! Run: pip install opuslib")
+        log.error("Also need: brew install opus (macOS) or apt install libopus0 (Linux)")
+        return b""
+
+    enc = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
+    frame_samples = sample_rate // 50  # 20ms frames
+    frame_bytes = frame_samples * 2     # s16le
+
+    frames = bytearray()
+    for i in range(0, len(pcm_s16) - frame_bytes + 1, frame_bytes):
+        pcm_frame = pcm_s16[i:i + frame_bytes]
+        opus_frame = enc.encode(pcm_frame, frame_samples)
+        frames.extend(struct.pack('<H', len(opus_frame)))
+        frames.extend(opus_frame)
+
+    # End marker
+    frames.extend(struct.pack('<H', 0))
+
+    ratio = len(pcm_s16) / len(frames) if frames else 0
+    log.info(f"Opus encode: {len(pcm_s16):,} bytes PCM → {len(frames):,} bytes Opus ({ratio:.1f}:1)")
+    return bytes(frames)
+
+
+def pcm_to_ulaw(pcm_data: bytes) -> bytes:
+    """Encode signed 16-bit PCM to µ-law 8-bit."""
+    samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.int32)
+    BIAS = 0x84
+    MAX = 0x7FFF
+
+    sign = (samples >> 8) & 0x80
+    abs_samples = np.abs(samples)
+    abs_samples = np.clip(abs_samples, 0, MAX)
+    abs_samples += BIAS
+
+    # Find exponent (position of highest set bit)
+    exponent = np.zeros(len(samples), dtype=np.int32)
+    for exp in range(7, 0, -1):
+        mask = abs_samples & (0x4000 >> (7 - exp))
+        exponent = np.where((exponent == 0) & (mask != 0), exp, exponent)
+
+    mantissa = (abs_samples >> (exponent + 3)) & 0x0F
+    ulaw = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return ulaw.astype(np.uint8).tobytes()
+
+
+def upsample_8k_to_16k(pcm_8k: bytes) -> bytes:
+    """Upsample 8kHz s16le PCM to 16kHz with linear interpolation."""
+    # Align to sample boundary
+    pcm_8k = pcm_8k[:len(pcm_8k) & ~1]
+    if len(pcm_8k) == 0:
+        return b""
+    samples = np.frombuffer(pcm_8k, dtype=np.int16)
+    upsampled = np.zeros(len(samples) * 2, dtype=np.int16)
+    upsampled[0::2] = samples
+    upsampled[1::2][:-1] = ((samples[:-1].astype(np.int32) + samples[1:].astype(np.int32)) // 2).astype(np.int16)
+    upsampled[-1] = samples[-1]
+    return upsampled.tobytes()
 
 
 async def stt_transcribe(audio_pcm):
@@ -169,7 +255,10 @@ async def process_query(pcm_data):
         log.info("[CONV] Expired — clearing")
         conversation["history"] = []
 
-    transcript = await stt_transcribe(pcm_data)
+    # Decode µ-law 8-bit → s16le PCM for STT
+    pcm_16 = ulaw_to_pcm(pcm_data)
+    log.info(f"Decoded µ-law {len(pcm_data):,} bytes → {len(pcm_16):,} bytes PCM ({len(pcm_16)/2/STT_SAMPLE_RATE:.1f}s)")
+    transcript = await stt_transcribe(pcm_16)
     if not transcript.strip():
         transcript = "Hello"
         log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
@@ -279,8 +368,9 @@ class HeliosClient:
         # Size header
         header = struct.pack('<I', len(pcm_bytes))
         await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=False)
+        await asyncio.sleep(0.01)
 
-        # Data chunks
+        # Data chunks with pacing
         offset = 0
         chunks = 0
         while offset < len(pcm_bytes):
@@ -289,10 +379,10 @@ class HeliosClient:
             await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=False)
             offset = end
             chunks += 1
-            # Pace every chunk — give ESP time to process
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0.01)  # pace to avoid overwhelming ESP
 
         # End marker
+        await asyncio.sleep(0.05)
         await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=False)
 
         dur = len(pcm_bytes) / 2 / TTS_SAMPLE_RATE
@@ -315,6 +405,11 @@ class HeliosClient:
             dur = len(pcm_data) / 2 / STT_SAMPLE_RATE
             log.info(f"Received {len(pcm_data):,} bytes mic ({dur:.1f}s)")
 
+            # Save to disk for debugging
+            with open("output/ble_mic_capture.pcm", "wb") as df:
+                df.write(pcm_data)
+            log.info(f"Saved to output/ble_mic_capture.pcm")
+
             # Signal processing
             await self.client.write_gatt_char(
                 CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
@@ -322,9 +417,14 @@ class HeliosClient:
             # Pipeline
             tts_audio = await process_query(pcm_data)
 
-            # Send TTS back
+            # Opus encode TTS before sending (~10:1 compression)
             if tts_audio:
-                await self.send_tts(tts_audio)
+                tts_opus = pcm_to_opus(tts_audio, TTS_SAMPLE_RATE)
+                if tts_opus:
+                    await self.send_tts(tts_opus)
+                else:
+                    log.error("Opus encode failed, falling back to µ-law")
+                    await self.send_tts(pcm_to_ulaw(tts_audio))
 
             log.info("Waiting for next button press...\n")
 

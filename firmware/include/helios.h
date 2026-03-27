@@ -27,8 +27,9 @@
 // --- PDM Microphone (MSM261S4030H0) ---
 #define MIC_CLK_PIN     42
 #define MIC_DATA_PIN    41
-#define MIC_SAMPLE_RATE 16000
-#define MIC_BIT_DEPTH   16
+#define MIC_SAMPLE_RATE     16000
+#define MIC_BIT_DEPTH       16
+#define MIC_BLE_SAMPLE_RATE 8000   // Downsampled for BLE transport
 
 // --- Camera API ---
 esp_err_t camera_init(void);
@@ -62,7 +63,8 @@ bool      sdcard_is_mounted(void);
 #define SPK_LRC_PIN     5   // D4 — WS / word select
 #define SPK_BCLK_PIN    6   // D5 — bit clock
 #define SPK_DIN_PIN     43  // D6 — data in
-#define SPK_SAMPLE_RATE 24000
+#define SPK_SAMPLE_RATE     24000
+#define TTS_BLE_SAMPLE_RATE 8000   // TTS sample rate for BLE transport
 // Max PCM scale factor before amp clips (5V supply, GAIN=GND +15dB, 8Ω load)
 // +15dB = 5.62x gain. At 5V BTL max ~4.6V peak differential.
 // Full-scale would produce ~5.0V peak → clip. Safe ceiling ~0.90.
@@ -73,6 +75,9 @@ esp_err_t speaker_init(void);
 void      speaker_set_volume(int percent);  // 0-100
 int       speaker_get_volume(void);
 esp_err_t speaker_play(const uint8_t *pcm_s16, size_t len);
+esp_err_t speaker_play_8k(const uint8_t *pcm_s16_8k, size_t len);
+esp_err_t speaker_play_ulaw(const uint8_t *ulaw_data, size_t len, int src_sample_rate);
+esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample_rate);
 esp_err_t speaker_stop(void);
 
 // --- BLE (NimBLE GATT Server) ---

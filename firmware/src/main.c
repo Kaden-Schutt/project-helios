@@ -61,7 +61,7 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
         tts_received = 0;
         tts_done = false;
         ESP_LOGI(TAG, "TTS incoming: %zu bytes (%.1fs)",
-                 tts_expected, (float)tts_expected / (SPK_SAMPLE_RATE * 2));
+                 tts_expected, (float)tts_expected / (TTS_BLE_SAMPLE_RATE * 2));
         data += 4;
         len -= 4;
     }
@@ -247,11 +247,10 @@ wait_tts:
             tts_expected = 0;
             tts_done = false;
 
-            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(30000)) == pdTRUE && tts_received > 0) {
-                ESP_LOGI(TAG, "Playing TTS (%zu bytes, %.1fs)...",
-                         tts_received, (float)tts_received / (SPK_SAMPLE_RATE * 2));
+            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(60000)) == pdTRUE && tts_received > 0) {
+                ESP_LOGI(TAG, "Playing Opus TTS (%zu bytes)...", tts_received);
                 if (spk_ok == ESP_OK) {
-                    speaker_play(tts_buf, tts_received);
+                    speaker_play_opus(tts_buf, tts_received, SPK_SAMPLE_RATE);
                 }
                 ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
                 ESP_LOGI(TAG, "Done.");
