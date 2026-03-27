@@ -41,7 +41,7 @@ TTS_SAMPLE_RATE = 24000  # Matches ESP speaker; Opus compresses regardless of ra
 CARTESIA_VERSION = "2026-01-12"
 
 LLM_MODEL = "google/gemini-3.1-flash-lite-preview:nitro"
-LLM_VISION_MODEL = "google/gemini-3.1-pro-preview:nitro"  # vision-capable model
+LLM_VISION_MODEL = "google/gemini-3.1-flash-lite-preview:nitro"  # same model, handles vision too
 LLM_MAX_TOKENS = 300
 
 SYSTEM_PROMPT = """You are an assistive AI embedded in a wearable device for a vision-impaired user.
@@ -279,28 +279,14 @@ async def tts_synthesize(text):
     return resp.content
 
 
-async def process_query_streaming(pcm_data, is_pcm, send_tts_cb):
-    """Fully streaming pipeline: STT → LLM streaming → TTS streaming → Opus → BLE.
-    send_tts_cb(opus_bytes) is called for each Opus-encoded TTS chunk."""
-    total_t0 = time.time()
+async def _run_llm_tts_streaming(transcript, send_tts_cb, total_t0):
+    """LLM streaming → TTS streaming → Opus encode → BLE.
+    Called after STT is complete. send_tts_cb(opus_bytes) sends each chunk."""
 
     # Conversation timeout
     if conversation["history"] and time.time() - conversation["last_time"] > CONVERSATION_TIMEOUT:
         log.info("[CONV] Expired — clearing")
         conversation["history"] = []
-
-    # STT (batch for now — already fast since audio arrived via Opus stream)
-    if is_pcm:
-        transcript = await stt_transcribe(pcm_data)
-    else:
-        pcm_16 = ulaw_to_pcm(pcm_data)
-        transcript = await stt_transcribe(pcm_16)
-    if not transcript.strip():
-        transcript = "Hello"
-        log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
-
-    stt_time = time.time() - total_t0
-    log.info(f"[STT] Done in {stt_time:.1f}s: \"{transcript}\"")
 
     # Inject image if available in input/ directory
     image_b64 = get_next_image_b64()
@@ -499,12 +485,77 @@ class HeliosClient:
     def __init__(self):
         self.client = None
         self.mic_buffer = bytearray()
-        self.mic_expected = 0
         self.mic_receiving = False
         self.mic_opus_mode = False
         self.mic_opus_frames = 0
         self.opus_dec = None
         self.query_event = asyncio.Event()
+        # Streaming STT state
+        self.stt_ws = None
+        self.stt_transcript_parts = []
+        self.stt_transcript_ready = asyncio.Event()
+        self.stt_reader_task = None
+        self.record_start_time = None
+
+    async def _open_stt_stream(self):
+        """Open STT WebSocket for real-time streaming."""
+        uri = (f"wss://api.cartesia.ai/stt/websocket"
+               f"?model={STT_MODEL}&encoding=pcm_s16le&sample_rate={STT_SAMPLE_RATE}&language=en")
+        headers = {"X-API-Key": CARTESIA_API_KEY, "Cartesia-Version": CARTESIA_VERSION}
+        self.stt_transcript_parts = []
+        self.stt_transcript_ready.clear()
+        try:
+            self.stt_ws = await websockets.connect(uri, additional_headers=headers)
+            self.stt_reader_task = asyncio.create_task(self._stt_reader())
+            log.info("[STT] WebSocket opened for streaming")
+        except Exception as e:
+            log.error(f"[STT] WebSocket open failed: {e}")
+            self.stt_ws = None
+
+    async def _stt_reader(self):
+        """Background task: read STT transcript results."""
+        try:
+            async for msg in self.stt_ws:
+                if isinstance(msg, str):
+                    data = json.loads(msg)
+                    if data.get("type") == "transcript" and data.get("is_final"):
+                        text = data.get("text", "").strip()
+                        if text:
+                            self.stt_transcript_parts.append(text)
+                    elif data.get("type") in ("done", "flush_done"):
+                        break
+                    elif data.get("type") == "error":
+                        log.error(f"[STT] Error: {data}")
+                        break
+        except Exception as e:
+            log.error(f"[STT] Reader error: {e}")
+        finally:
+            self.stt_transcript_ready.set()
+
+    async def _send_pcm_to_stt(self, pcm_chunk: bytes):
+        """Forward decoded PCM to STT WebSocket."""
+        if self.stt_ws and pcm_chunk:
+            try:
+                await self.stt_ws.send(pcm_chunk)
+            except Exception:
+                pass
+
+    async def _finalize_stt(self):
+        """Send 'done' to STT and wait for transcript."""
+        if self.stt_ws:
+            try:
+                await self.stt_ws.send("done")
+            except Exception:
+                pass
+        await self.stt_transcript_ready.wait()
+        if self.stt_ws:
+            try:
+                await self.stt_ws.close()
+            except Exception:
+                pass
+            self.stt_ws = None
+        transcript = " ".join(self.stt_transcript_parts)
+        return transcript
 
     def _on_mic_notify(self, sender, data: bytearray):
         if len(data) == 0:
@@ -517,7 +568,6 @@ class HeliosClient:
             return
 
         if not self.mic_receiving:
-            # Check for Opus stream marker (0xFFFFFFFF)
             if len(data) >= 4 and data[:4] == b'\xFF\xFF\xFF\xFF':
                 self.mic_opus_mode = True
                 self.mic_buffer = bytearray()
@@ -531,18 +581,8 @@ class HeliosClient:
                     log.error(f"[MIC] Opus decoder create failed: {e}")
                     self.opus_dec = None
                 return
-            # Legacy µ-law mode (4-byte size header)
-            elif len(data) >= 4:
-                self.mic_opus_mode = False
-                self.opus_dec = None
-                self.mic_expected = struct.unpack('<I', data[:4])[0]
-                self.mic_buffer = bytearray()
-                self.mic_receiving = True
-                self.mic_buffer.extend(data[4:])
-                log.info(f"[MIC] µ-law stream started: {self.mic_expected:,} bytes expected")
         else:
             if self.mic_opus_mode and self.opus_dec:
-                # Decode Opus frames: [uint16_le len][opus data]
                 offset = 0
                 while offset + 2 <= len(data):
                     frame_len = data[offset] | (data[offset + 1] << 8)
@@ -555,14 +595,11 @@ class HeliosClient:
                         pcm = self.opus_dec.decode(opus_frame, STT_SAMPLE_RATE // 50)
                         self.mic_buffer.extend(pcm)
                         self.mic_opus_frames += 1
+                        # Forward to STT WebSocket in real-time
+                        if self.stt_ws:
+                            asyncio.get_event_loop().create_task(self._send_pcm_to_stt(pcm))
                     except Exception as e:
                         log.warning(f"[MIC] Opus decode error: {e}")
-            else:
-                # Legacy µ-law: just accumulate raw bytes
-                self.mic_buffer.extend(data)
-                if len(self.mic_buffer) % 10240 < BLE_CHUNK_SIZE:
-                    pct = len(self.mic_buffer) / self.mic_expected * 100 if self.mic_expected else 0
-                    log.info(f"[MIC] {len(self.mic_buffer):,}/{self.mic_expected:,} bytes ({pct:.0f}%)")
 
     def _on_control_notify(self, sender, data: bytearray):
         if len(data) == 0:
@@ -570,8 +607,11 @@ class HeliosClient:
         cmd = data[0]
         if cmd == CMD_BUTTON_PRESSED:
             log.info("[ESP32] Button pressed — recording...")
+            self.record_start_time = time.time()
+            # Open STT WebSocket immediately for real-time streaming
+            asyncio.get_event_loop().create_task(self._open_stt_stream())
         elif cmd == CMD_BUTTON_RELEASED:
-            log.info("[ESP32] Button released — sending mic data...")
+            log.info("[ESP32] Button released")
         elif cmd == CMD_PLAYBACK_DONE:
             log.info("[ESP32] Playback finished")
 
@@ -668,9 +708,19 @@ class HeliosClient:
             if len(self.mic_buffer) == 0:
                 continue
 
-            pcm_data = bytes(self.mic_buffer)
-            dur = len(pcm_data) / 2 / STT_SAMPLE_RATE
-            log.info(f"Received {len(pcm_data):,} bytes PCM ({dur:.1f}s)")
+            t0 = time.time()
+            dur = len(self.mic_buffer) / 2 / STT_SAMPLE_RATE
+            log.info(f"Mic stream complete: {len(self.mic_buffer):,} bytes PCM ({dur:.1f}s)")
+
+            # Finalize STT — transcript should be almost ready since we streamed audio
+            log.info("[STT] Finalizing streaming transcript...")
+            transcript = await self._finalize_stt()
+            stt_time = time.time() - t0
+            if not transcript.strip():
+                transcript = "Hello"
+                log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
+            else:
+                log.info(f"[STT] Done in {stt_time:.1f}s: \"{transcript}\"")
 
             # Signal processing
             await self.client.write_gatt_char(
@@ -683,9 +733,9 @@ class HeliosClient:
             async def on_tts_opus_chunk(opus_data):
                 await self.send_tts_chunk(opus_data)
 
-            # Run fully streaming pipeline: STT → LLM stream → TTS stream → BLE
-            await process_query_streaming(
-                pcm_data, is_pcm=self.mic_opus_mode, send_tts_cb=on_tts_opus_chunk)
+            # Run LLM streaming → TTS streaming → Opus → BLE
+            # (STT already done above via streaming)
+            await _run_llm_tts_streaming(transcript, on_tts_opus_chunk, t0)
 
             # End TTS stream
             await self.send_tts_end()
