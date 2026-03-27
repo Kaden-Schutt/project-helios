@@ -8,7 +8,7 @@
 #include <string.h>
 
 static const char *TAG = "mic";
-static i2s_chan_handle_t s_rx_chan = NULL;
+i2s_chan_handle_t s_rx_chan = NULL;  // non-static: accessed by ble.c for Opus streaming
 
 esp_err_t mic_init(void)
 {

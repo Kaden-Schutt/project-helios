@@ -247,7 +247,7 @@ async def tts_synthesize(text):
     return resp.content
 
 
-async def process_query(pcm_data):
+async def process_query(pcm_data, is_pcm=True):
     total_t0 = time.time()
 
     # Conversation timeout
@@ -255,10 +255,14 @@ async def process_query(pcm_data):
         log.info("[CONV] Expired — clearing")
         conversation["history"] = []
 
-    # Decode µ-law 8-bit → s16le PCM for STT
-    pcm_16 = ulaw_to_pcm(pcm_data)
-    log.info(f"Decoded µ-law {len(pcm_data):,} bytes → {len(pcm_16):,} bytes PCM ({len(pcm_16)/2/STT_SAMPLE_RATE:.1f}s)")
-    transcript = await stt_transcribe(pcm_16)
+    # pcm_data is s16le PCM if from Opus mode (decoded in _on_mic_notify)
+    # or raw µ-law bytes if from legacy mode (needs decode here)
+    if is_pcm:
+        transcript = await stt_transcribe(pcm_data)
+    else:
+        pcm_16 = ulaw_to_pcm(pcm_data)
+        log.info(f"Decoded µ-law {len(pcm_data):,} → {len(pcm_16):,} bytes PCM")
+        transcript = await stt_transcribe(pcm_16)
     if not transcript.strip():
         transcript = "Hello"
         log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
@@ -283,27 +287,68 @@ class HeliosClient:
         self.mic_buffer = bytearray()
         self.mic_expected = 0
         self.mic_receiving = False
+        self.mic_opus_mode = False
+        self.mic_opus_frames = 0
+        self.opus_dec = None
         self.query_event = asyncio.Event()
 
     def _on_mic_notify(self, sender, data: bytearray):
         if len(data) == 0:
+            # End of stream
+            if self.mic_opus_mode and self.opus_dec:
+                log.info(f"[MIC] Opus stream done: {self.mic_opus_frames} frames, "
+                         f"{len(self.mic_buffer):,} bytes PCM ({len(self.mic_buffer)/2/STT_SAMPLE_RATE:.1f}s)")
             self.mic_receiving = False
             self.query_event.set()
             return
 
         if not self.mic_receiving:
-            if len(data) >= 4:
+            # Check for Opus stream marker (0xFFFFFFFF)
+            if len(data) >= 4 and data[:4] == b'\xFF\xFF\xFF\xFF':
+                self.mic_opus_mode = True
+                self.mic_buffer = bytearray()
+                self.mic_receiving = True
+                self.mic_opus_frames = 0
+                try:
+                    import opuslib
+                    self.opus_dec = opuslib.Decoder(STT_SAMPLE_RATE, 1)
+                    log.info("[MIC] Opus stream started")
+                except Exception as e:
+                    log.error(f"[MIC] Opus decoder create failed: {e}")
+                    self.opus_dec = None
+                return
+            # Legacy µ-law mode (4-byte size header)
+            elif len(data) >= 4:
+                self.mic_opus_mode = False
+                self.opus_dec = None
                 self.mic_expected = struct.unpack('<I', data[:4])[0]
                 self.mic_buffer = bytearray()
                 self.mic_receiving = True
                 self.mic_buffer.extend(data[4:])
-                log.info(f"[MIC] Stream started: {self.mic_expected:,} bytes expected")
+                log.info(f"[MIC] µ-law stream started: {self.mic_expected:,} bytes expected")
         else:
-            self.mic_buffer.extend(data)
-            # Progress every 10KB
-            if len(self.mic_buffer) % 10240 < BLE_CHUNK_SIZE:
-                pct = len(self.mic_buffer) / self.mic_expected * 100 if self.mic_expected else 0
-                log.info(f"[MIC] {len(self.mic_buffer):,}/{self.mic_expected:,} bytes ({pct:.0f}%)")
+            if self.mic_opus_mode and self.opus_dec:
+                # Decode Opus frames: [uint16_le len][opus data]
+                offset = 0
+                while offset + 2 <= len(data):
+                    frame_len = data[offset] | (data[offset + 1] << 8)
+                    offset += 2
+                    if frame_len == 0 or offset + frame_len > len(data):
+                        break
+                    opus_frame = bytes(data[offset:offset + frame_len])
+                    offset += frame_len
+                    try:
+                        pcm = self.opus_dec.decode(opus_frame, STT_SAMPLE_RATE // 50)
+                        self.mic_buffer.extend(pcm)
+                        self.mic_opus_frames += 1
+                    except Exception as e:
+                        log.warning(f"[MIC] Opus decode error: {e}")
+            else:
+                # Legacy µ-law: just accumulate raw bytes
+                self.mic_buffer.extend(data)
+                if len(self.mic_buffer) % 10240 < BLE_CHUNK_SIZE:
+                    pct = len(self.mic_buffer) / self.mic_expected * 100 if self.mic_expected else 0
+                    log.info(f"[MIC] {len(self.mic_buffer):,}/{self.mic_expected:,} bytes ({pct:.0f}%)")
 
     def _on_control_notify(self, sender, data: bytearray):
         if len(data) == 0:
@@ -403,7 +448,8 @@ class HeliosClient:
 
             pcm_data = bytes(self.mic_buffer)
             dur = len(pcm_data) / 2 / STT_SAMPLE_RATE
-            log.info(f"Received {len(pcm_data):,} bytes mic ({dur:.1f}s)")
+            mode = "Opus" if self.mic_opus_mode else "µ-law"
+            log.info(f"Received {len(pcm_data):,} bytes PCM ({dur:.1f}s) via {mode}")
 
             # Save to disk for debugging
             with open("output/ble_mic_capture.pcm", "wb") as df:
@@ -414,8 +460,8 @@ class HeliosClient:
             await self.client.write_gatt_char(
                 CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
 
-            # Pipeline
-            tts_audio = await process_query(pcm_data)
+            # Pipeline (Opus mode: pcm_data is already decoded PCM)
+            tts_audio = await process_query(pcm_data, is_pcm=self.mic_opus_mode)
 
             # Opus encode TTS before sending (~10:1 compression)
             if tts_audio:

@@ -11,6 +11,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "driver/i2s_pdm.h"
+#include "opus.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -460,6 +462,114 @@ esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len)
 
     fclose(f);
     ESP_LOGI(TAG, "Sent %zu bytes µ-law (from %zu bytes PCM) from %s", sent, file_len, path);
+    return ESP_OK;
+}
+
+esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms)
+{
+    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
+
+    // Create Opus encoder
+    int opus_err;
+    OpusEncoder *enc = opus_encoder_create(MIC_SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_err);
+    if (!enc || opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "Opus encoder create failed: %d", opus_err);
+        return ESP_FAIL;
+    }
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(16000));
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(3));  // low complexity for real-time
+
+    // I2S mic channel — get from mic.c (it's already initialized and enabled)
+    extern i2s_chan_handle_t s_rx_chan;  // from mic.c
+
+    // 20ms frame at 16kHz = 320 samples = 640 bytes PCM
+    const int frame_samples = MIC_SAMPLE_RATE / 50;  // 320
+    const int frame_bytes = frame_samples * 2;         // 640
+    int16_t *pcm_frame = heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM);
+    uint8_t *opus_out = malloc(256);  // max Opus frame size
+    if (!pcm_frame || !opus_out) {
+        ESP_LOGE(TAG, "Alloc failed for Opus stream buffers");
+        if (pcm_frame) free(pcm_frame);
+        if (opus_out) free(opus_out);
+        opus_encoder_destroy(enc);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Send a "start" marker: 4 bytes with 0xFFFFFFFF to signal Opus stream mode
+    uint8_t start_marker[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(start_marker, 4);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+
+    size_t frames_sent = 0;
+    size_t total_opus_bytes = 0;
+    size_t min_bytes = (MIC_SAMPLE_RATE * 2 * 500) / 1000;  // 500ms minimum
+    size_t total_pcm_read = 0;
+    size_t max_bytes = (MIC_SAMPLE_RATE * 2 * max_ms) / 1000;
+
+    ESP_LOGI(TAG, "Opus mic streaming started (20ms frames, 16kbps)");
+
+    while (total_pcm_read < max_bytes) {
+        // Check button after minimum recording time
+        if (total_pcm_read >= min_bytes && !keep_going()) break;
+
+        // Read one 20ms frame from I2S
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_rx_chan, pcm_frame, frame_bytes,
+                                          &bytes_read, pdMS_TO_TICKS(1000));
+        if (err != ESP_OK || bytes_read < (size_t)frame_bytes) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        total_pcm_read += bytes_read;
+
+        // Remove DC offset from frame
+        int32_t sum = 0;
+        for (int i = 0; i < frame_samples; i++) sum += pcm_frame[i];
+        int16_t dc = (int16_t)(sum / frame_samples);
+        for (int i = 0; i < frame_samples; i++) pcm_frame[i] -= dc;
+
+        // Opus encode
+        int opus_len = opus_encode(enc, pcm_frame, frame_samples, opus_out, 256);
+        if (opus_len < 0) {
+            ESP_LOGW(TAG, "Opus encode error: %d", opus_len);
+            continue;
+        }
+
+        // Send as BLE notification: [uint16_le len][opus data]
+        uint8_t notify_buf[260];
+        notify_buf[0] = opus_len & 0xFF;
+        notify_buf[1] = (opus_len >> 8) & 0xFF;
+        memcpy(notify_buf + 2, opus_out, opus_len);
+
+        int retries = 0;
+        while (retries < 20) {
+            om = ble_hs_mbuf_from_flat(notify_buf, 2 + opus_len);
+            if (!om) { vTaskDelay(pdMS_TO_TICKS(5)); retries++; continue; }
+            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+            if (rc == 0) break;
+            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                vTaskDelay(pdMS_TO_TICKS(5)); retries++; continue;
+            }
+            break;
+        }
+
+        frames_sent++;
+        total_opus_bytes += opus_len;
+    }
+
+    // End marker
+    vTaskDelay(pdMS_TO_TICKS(50));
+    om = ble_hs_mbuf_from_flat(NULL, 0);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+
+    free(pcm_frame);
+    free(opus_out);
+    opus_encoder_destroy(enc);
+
+    float duration = (float)total_pcm_read / (MIC_SAMPLE_RATE * 2);
+    ESP_LOGI(TAG, "Opus stream done: %zu frames, %zu bytes Opus (%.1fs audio, %.1f:1)",
+             frames_sent, total_opus_bytes, duration,
+             total_pcm_read > 0 ? (float)total_pcm_read / total_opus_bytes : 0);
     return ESP_OK;
 }
 

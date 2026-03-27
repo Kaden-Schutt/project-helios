@@ -106,6 +106,7 @@ esp_err_t ble_init(ble_tts_chunk_cb tts_cb, ble_control_cb ctrl_cb);
 bool      ble_is_connected(void);
 esp_err_t ble_send_mic_data(const uint8_t *pcm, size_t len);
 esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len);
+esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms);
 esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload_len);
 void      ble_start_advertising(void);
 

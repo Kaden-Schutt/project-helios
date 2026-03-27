@@ -200,48 +200,16 @@ void app_main(void)
             if (!button_pressed()) goto poll;
 
             ESP_LOGI(TAG, "LISTENING...");
-            esp_err_t nrc = ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
-            ESP_LOGI(TAG, "Button notify: %d", nrc);
+            ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
 
-            // Record mic
-            size_t pcm_len = 0;
-            bool used_sd = false;
-
+            // Stream mic → Opus encode → BLE in real-time
             if (mic_ok == ESP_OK) {
-                if (sd_ok == ESP_OK) {
-                    mic_record_to_file(button_pressed, 30000,
-                                       SD_MOUNT_POINT "/mic.pcm", &pcm_len);
-                    used_sd = true;
-                } else {
-                    uint8_t *pcm_buf = NULL;
-                    mic_record_while(button_pressed, 30000, &pcm_buf, &pcm_len);
-                    if (pcm_buf) {
-                        // Send from PSRAM
-                        ESP_LOGI(TAG, "Sending %zu bytes mic over BLE...", pcm_len);
-                        ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
-                        ble_send_mic_data(pcm_buf, pcm_len);
-                        mic_free_buf(pcm_buf);
-                        goto wait_tts;
-                    }
-                }
+                ble_stream_mic_opus(button_pressed, 30000);
             }
 
-            if (pcm_len == 0) {
-                ESP_LOGW(TAG, "No audio recorded");
-                goto poll;
-            }
-
-            ESP_LOGI(TAG, "Recorded %.1fs", (float)pcm_len / (MIC_SAMPLE_RATE * 2));
             ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
 
-            // Send mic data over BLE
-            if (used_sd) {
-                ESP_LOGI(TAG, "Sending %zu bytes mic over BLE...", pcm_len);
-                ble_send_mic_data_from_file(SD_MOUNT_POINT "/mic.pcm", pcm_len);
-            }
-
-wait_tts:
-            // Wait for TTS response (30s timeout)
+            // Wait for TTS response
             ESP_LOGI(TAG, "Waiting for TTS...");
             tts_received = 0;
             tts_expected = 0;
