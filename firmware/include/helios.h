@@ -96,6 +96,7 @@ esp_err_t speaker_stop(void);
 #define BLE_CMD_BUTTON_RELEASED 0x11
 #define BLE_CMD_PLAYBACK_DONE   0x12
 #define BLE_CMD_DEVICE_STATUS   0x13
+#define BLE_CMD_TEST_THROUGHPUT 0x20  // Pi requests throughput test
 
 // Callbacks
 typedef void (*ble_tts_chunk_cb)(const uint8_t *data, size_t len, bool is_first, bool is_last);
@@ -108,6 +109,7 @@ esp_err_t ble_send_mic_data(const uint8_t *pcm, size_t len);
 esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len);
 esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms);
 esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload_len);
+esp_err_t ble_test_throughput(size_t total_bytes);
 void      ble_start_advertising(void);
 
 // --- Config (persistent JSON on SD card) ---

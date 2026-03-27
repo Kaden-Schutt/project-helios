@@ -163,6 +163,25 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             s_conn_handle = event->connect.conn_handle;
             s_tts_first_write = true;
             ESP_LOGI(TAG, "Connected (handle=%d)", s_conn_handle);
+
+            // Request 2M PHY for higher throughput
+            ble_gap_set_prefered_le_phy(s_conn_handle,
+                BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK,
+                BLE_GAP_LE_PHY_CODED_ANY);
+
+            // Request max DLE (251 byte PDUs)
+            ble_att_set_preferred_mtu(BLE_MTU);
+
+            // Request tight connection interval (7.5ms min, 15ms max)
+            struct ble_gap_upd_params conn_params = {
+                .itvl_min = 6,      // 7.5ms (6 × 1.25ms)
+                .itvl_max = 12,     // 15ms
+                .latency = 0,
+                .supervision_timeout = 500, // 5 seconds
+                .min_ce_len = 0,
+                .max_ce_len = 0,
+            };
+            ble_gap_update_params(s_conn_handle, &conn_params);
         } else {
             ESP_LOGW(TAG, "Connection failed: %d", event->connect.status);
             ble_start_advertising();
@@ -193,6 +212,19 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_TX:
         break;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        ESP_LOGI(TAG, "PHY updated: TX=%d RX=%d (1=1M, 2=2M, 3=Coded)",
+                 event->phy_updated.tx_phy, event->phy_updated.rx_phy);
+        break;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc desc;
+        ble_gap_conn_find(event->conn_update.conn_handle, &desc);
+        ESP_LOGI(TAG, "Conn params updated: interval=%d latency=%d",
+                 desc.conn_itvl, desc.conn_latency);
+        break;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption changed: status=%d", event->enc_change.status);
@@ -248,7 +280,11 @@ static void ble_on_sync(void)
         ESP_LOGE(TAG, "id_infer_auto failed: %d", rc);
         return;
     }
-    ESP_LOGI(TAG, "BLE host synced (addr_type=%d), starting advertising...", s_own_addr_type);
+    // Set default preferred PHY to 2M for all future connections
+    ble_gap_set_prefered_default_le_phy(
+        BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK);
+
+    ESP_LOGI(TAG, "BLE host synced (addr_type=%d, 2M PHY preferred), starting advertising...", s_own_addr_type);
     ble_start_advertising();
 }
 
@@ -570,6 +606,50 @@ esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms)
     ESP_LOGI(TAG, "Opus stream done: %zu frames, %zu bytes Opus (%.1fs audio, %.1f:1)",
              frames_sent, total_opus_bytes, duration,
              total_pcm_read > 0 ? (float)total_pcm_read / total_opus_bytes : 0);
+    return ESP_OK;
+}
+
+esp_err_t ble_test_throughput(size_t total_bytes)
+{
+    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
+
+    // Send 4-byte size header
+    uint8_t hdr[4] = {
+        (total_bytes >>  0) & 0xFF, (total_bytes >>  8) & 0xFF,
+        (total_bytes >> 16) & 0xFF, (total_bytes >> 24) & 0xFF,
+    };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 4);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+
+    uint8_t buf[BLE_CHUNK_SIZE];
+    size_t sent = 0;
+    // Fill with pattern
+    for (size_t i = 0; i < BLE_CHUNK_SIZE; i++) buf[i] = (uint8_t)(i & 0xFF);
+
+    while (sent < total_bytes) {
+        size_t chunk = total_bytes - sent;
+        if (chunk > BLE_CHUNK_SIZE) chunk = BLE_CHUNK_SIZE;
+
+        int retries = 0;
+        while (retries < 20) {
+            om = ble_hs_mbuf_from_flat(buf, chunk);
+            if (!om) { vTaskDelay(pdMS_TO_TICKS(1)); retries++; continue; }
+            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+            if (rc == 0) break;
+            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                vTaskDelay(pdMS_TO_TICKS(1)); retries++; continue;
+            }
+            break;
+        }
+        sent += chunk;
+    }
+
+    // End marker
+    vTaskDelay(pdMS_TO_TICKS(50));
+    om = ble_hs_mbuf_from_flat(NULL, 0);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+
+    ESP_LOGI(TAG, "Throughput test: sent %zu bytes", sent);
     return ESP_OK;
 }
 

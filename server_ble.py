@@ -247,7 +247,9 @@ async def tts_synthesize(text):
     return resp.content
 
 
-async def process_query(pcm_data, is_pcm=True):
+async def process_query_streaming(pcm_data, is_pcm, send_tts_cb):
+    """Fully streaming pipeline: STT → LLM streaming → TTS streaming → Opus → BLE.
+    send_tts_cb(opus_bytes) is called for each Opus-encoded TTS chunk."""
     total_t0 = time.time()
 
     # Conversation timeout
@@ -255,26 +257,193 @@ async def process_query(pcm_data, is_pcm=True):
         log.info("[CONV] Expired — clearing")
         conversation["history"] = []
 
-    # pcm_data is s16le PCM if from Opus mode (decoded in _on_mic_notify)
-    # or raw µ-law bytes if from legacy mode (needs decode here)
+    # STT (batch for now — already fast since audio arrived via Opus stream)
     if is_pcm:
         transcript = await stt_transcribe(pcm_data)
     else:
         pcm_16 = ulaw_to_pcm(pcm_data)
-        log.info(f"Decoded µ-law {len(pcm_data):,} → {len(pcm_16):,} bytes PCM")
         transcript = await stt_transcribe(pcm_16)
     if not transcript.strip():
         transcript = "Hello"
         log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
 
-    response_text = await llm_query(transcript, conversation["history"])
+    stt_time = time.time() - total_t0
+    log.info(f"[STT] Done in {stt_time:.1f}s: \"{transcript}\"")
 
+    # LLM streaming — get tokens as they arrive
+    log.info(f"[LLM] Streaming: \"{transcript[:80]}\"")
+    llm_t0 = time.time()
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(conversation["history"])
+    messages.append({"role": "user", "content": transcript})
+
+    full_response = ""
+    sentence_buf = ""
+    tts_ws = None
+    opus_enc = None
+    first_audio_sent = False
+    total_tts_bytes = 0
+    total_opus_bytes = 0
+
+    try:
+        import opuslib
+        opus_enc = opuslib.Encoder(TTS_SAMPLE_RATE, 1, opuslib.APPLICATION_VOIP)
+    except Exception as e:
+        log.error(f"Opus encoder failed: {e}")
+
+    # Open TTS WebSocket
+    tts_uri = f"wss://api.cartesia.ai/tts/websocket?api_key={CARTESIA_API_KEY}&cartesia_version={CARTESIA_VERSION}"
+    try:
+        tts_ws = await websockets.connect(tts_uri)
+    except Exception as e:
+        log.error(f"[TTS] WebSocket open failed: {e}")
+        tts_ws = None
+
+    # Helper: send text to TTS WebSocket, receive audio chunks, Opus encode, send to ESP
+    async def flush_tts(text, is_last=False):
+        nonlocal first_audio_sent, total_tts_bytes, total_opus_bytes
+        if not tts_ws or not text.strip():
+            return
+
+        msg = {
+            "model_id": TTS_MODEL,
+            "transcript": text,
+            "voice": {"mode": "id", "id": TTS_VOICE_ID},
+            "output_format": {
+                "container": "raw",
+                "encoding": "pcm_s16le",
+                "sample_rate": TTS_SAMPLE_RATE,
+            },
+            "language": "en",
+            "context_id": "helios-stream",
+            "continue": not is_last,
+        }
+        await tts_ws.send(json.dumps(msg))
+
+        # Read audio chunks from TTS WebSocket
+        import base64
+        frame_samples = TTS_SAMPLE_RATE // 50  # 20ms
+        frame_bytes = frame_samples * 2
+        pcm_accum = bytearray()
+
+        async for response in tts_ws:
+            if isinstance(response, str):
+                data = json.loads(response)
+                if "data" in data and data["data"]:
+                    audio_chunk = base64.b64decode(data["data"])
+                    total_tts_bytes += len(audio_chunk)
+                    pcm_accum.extend(audio_chunk)
+
+                    # Opus encode complete 20ms frames and send
+                    while len(pcm_accum) >= frame_bytes and opus_enc:
+                        pcm_frame = bytes(pcm_accum[:frame_bytes])
+                        pcm_accum = pcm_accum[frame_bytes:]
+                        opus_frame = opus_enc.encode(pcm_frame, frame_samples)
+                        # Length-prefix for ESP
+                        opus_packet = struct.pack('<H', len(opus_frame)) + opus_frame
+                        total_opus_bytes += len(opus_frame)
+
+                        if not first_audio_sent:
+                            first_audio_sent = True
+                            latency = time.time() - total_t0
+                            log.info(f"[STREAM] First audio at {latency:.1f}s after query start")
+
+                        await send_tts_cb(opus_packet)
+
+                if data.get("done", False):
+                    break
+
+        # Flush remaining PCM
+        if len(pcm_accum) >= 2 and opus_enc:
+            # Pad to frame size
+            pad_len = frame_bytes - len(pcm_accum)
+            if pad_len > 0:
+                pcm_accum.extend(b'\x00' * pad_len)
+            opus_frame = opus_enc.encode(bytes(pcm_accum[:frame_bytes]), frame_samples)
+            opus_packet = struct.pack('<H', len(opus_frame)) + opus_frame
+            total_opus_bytes += len(opus_frame)
+            await send_tts_cb(opus_packet)
+
+    # Stream LLM tokens
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream(
+            "POST",
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+            json={"model": LLM_MODEL, "messages": messages, "max_tokens": LLM_MAX_TOKENS, "stream": True},
+        ) as resp:
+            first_token_time = None
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                    delta = chunk["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                            log.info(f"[LLM] First token at {first_token_time - llm_t0:.1f}s")
+                        full_response += content
+                        sentence_buf += content
+
+                        # Flush on sentence boundaries
+                        for delim in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
+                            if delim in sentence_buf:
+                                parts = sentence_buf.split(delim, 1)
+                                sentence_to_speak = parts[0] + delim.strip()
+                                sentence_buf = parts[1] if len(parts) > 1 else ""
+                                log.info(f"[TTS] Flushing: \"{sentence_to_speak}\"")
+                                await flush_tts(sentence_to_speak, is_last=False)
+                                break
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+    # Flush remaining text
+    if sentence_buf.strip():
+        log.info(f"[TTS] Flushing final: \"{sentence_buf.strip()}\"")
+        await flush_tts(sentence_buf.strip(), is_last=True)
+
+    # Send Opus end marker
+    await send_tts_cb(struct.pack('<H', 0))
+
+    # Close TTS WebSocket
+    if tts_ws:
+        try:
+            await tts_ws.close()
+        except:
+            pass
+
+    # Update conversation
+    conversation["history"].append({"role": "user", "content": transcript})
+    conversation["history"].append({"role": "assistant", "content": full_response})
+    conversation["last_time"] = time.time()
+
+    total_time = time.time() - total_t0
+    log.info(f"[LLM] Response: \"{full_response[:100]}\"")
+    log.info(f"[TOTAL] {total_time:.1f}s | TTS: {total_tts_bytes:,} PCM → {total_opus_bytes:,} Opus ({total_tts_bytes/max(total_opus_bytes,1):.1f}:1)")
+
+
+# Keep old batch function as fallback
+async def process_query(pcm_data, is_pcm=True):
+    total_t0 = time.time()
+    if conversation["history"] and time.time() - conversation["last_time"] > CONVERSATION_TIMEOUT:
+        conversation["history"] = []
+    if is_pcm:
+        transcript = await stt_transcribe(pcm_data)
+    else:
+        transcript = await stt_transcribe(ulaw_to_pcm(pcm_data))
+    if not transcript.strip():
+        transcript = "Hello"
+    response_text = await llm_query(transcript, conversation["history"])
     conversation["history"].append({"role": "user", "content": transcript})
     conversation["history"].append({"role": "assistant", "content": response_text})
     conversation["last_time"] = time.time()
-
     tts_audio = await tts_synthesize(response_text)
-
     log.info(f"[TOTAL] {time.time()-total_t0:.1f}s pipeline")
     return tts_audio
 
@@ -406,32 +575,40 @@ class HeliosClient:
         log.info(f"Connected to {device.name} [{device.address}]")
         return True
 
-    async def send_tts(self, pcm_bytes):
-        if not pcm_bytes:
-            return
-
-        # Size header
-        header = struct.pack('<I', len(pcm_bytes))
+    async def send_tts_start(self):
+        """Send TTS stream start marker (unknown size)."""
+        header = struct.pack('<I', 0xFFFFFFFF)  # streaming mode
         await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=False)
         await asyncio.sleep(0.01)
+        self._tts_chunks_sent = 0
+        self._tts_bytes_sent = 0
 
-        # Data chunks with pacing
+    async def send_tts_chunk(self, opus_data):
+        """Send a chunk of Opus data (already length-prefixed frames)."""
+        if not opus_data:
+            return
+        # Split into BLE-sized chunks if needed
         offset = 0
-        chunks = 0
-        while offset < len(pcm_bytes):
-            end = min(offset + BLE_CHUNK_SIZE, len(pcm_bytes))
-            chunk = pcm_bytes[offset:end]
+        while offset < len(opus_data):
+            end = min(offset + BLE_CHUNK_SIZE, len(opus_data))
+            chunk = opus_data[offset:end]
             await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=False)
             offset = end
-            chunks += 1
-            await asyncio.sleep(0.01)  # pace to avoid overwhelming ESP
+            self._tts_chunks_sent += 1
+            await asyncio.sleep(0.005)
+        self._tts_bytes_sent += len(opus_data)
 
-        # End marker
+    async def send_tts_end(self):
+        """Send TTS stream end marker."""
         await asyncio.sleep(0.05)
         await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=False)
+        log.info(f"[TX] Streamed {self._tts_bytes_sent:,} bytes Opus in {self._tts_chunks_sent} BLE chunks")
 
-        dur = len(pcm_bytes) / 2 / TTS_SAMPLE_RATE
-        log.info(f"[TX] Sent {len(pcm_bytes):,} bytes ({dur:.1f}s) in {chunks} chunks")
+    async def send_tts(self, data):
+        """Send pre-encoded TTS data (batch mode fallback)."""
+        await self.send_tts_start()
+        await self.send_tts_chunk(data)
+        await self.send_tts_end()
 
     async def run(self):
         log.info("Waiting for button press...\n")
@@ -448,29 +625,25 @@ class HeliosClient:
 
             pcm_data = bytes(self.mic_buffer)
             dur = len(pcm_data) / 2 / STT_SAMPLE_RATE
-            mode = "Opus" if self.mic_opus_mode else "µ-law"
-            log.info(f"Received {len(pcm_data):,} bytes PCM ({dur:.1f}s) via {mode}")
-
-            # Save to disk for debugging
-            with open("output/ble_mic_capture.pcm", "wb") as df:
-                df.write(pcm_data)
-            log.info(f"Saved to output/ble_mic_capture.pcm")
+            log.info(f"Received {len(pcm_data):,} bytes PCM ({dur:.1f}s)")
 
             # Signal processing
             await self.client.write_gatt_char(
                 CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
 
-            # Pipeline (Opus mode: pcm_data is already decoded PCM)
-            tts_audio = await process_query(pcm_data, is_pcm=self.mic_opus_mode)
+            # Start TTS stream to ESP
+            await self.send_tts_start()
 
-            # Opus encode TTS before sending (~10:1 compression)
-            if tts_audio:
-                tts_opus = pcm_to_opus(tts_audio, TTS_SAMPLE_RATE)
-                if tts_opus:
-                    await self.send_tts(tts_opus)
-                else:
-                    log.error("Opus encode failed, falling back to µ-law")
-                    await self.send_tts(pcm_to_ulaw(tts_audio))
+            # Streaming callback: sends Opus chunks to ESP over BLE as they're generated
+            async def on_tts_opus_chunk(opus_data):
+                await self.send_tts_chunk(opus_data)
+
+            # Run fully streaming pipeline: STT → LLM stream → TTS stream → BLE
+            await process_query_streaming(
+                pcm_data, is_pcm=self.mic_opus_mode, send_tts_cb=on_tts_opus_chunk)
+
+            # End TTS stream
+            await self.send_tts_end()
 
             log.info("Waiting for next button press...\n")
 

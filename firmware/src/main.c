@@ -60,8 +60,11 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
         tts_expected = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
         tts_received = 0;
         tts_done = false;
-        ESP_LOGI(TAG, "TTS incoming: %zu bytes (%.1fs)",
-                 tts_expected, (float)tts_expected / (TTS_BLE_SAMPLE_RATE * 2));
+        if (tts_expected == 0xFFFFFFFF) {
+            ESP_LOGI(TAG, "TTS streaming mode (size unknown)");
+        } else {
+            ESP_LOGI(TAG, "TTS incoming: %zu bytes", tts_expected);
+        }
         data += 4;
         len -= 4;
     }
@@ -102,6 +105,13 @@ static void on_control(uint8_t cmd, const uint8_t *payload, size_t payload_len)
     case BLE_CMD_ERROR:
         ESP_LOGW(TAG, "Pi error: %.*s", (int)payload_len, (const char *)payload);
         break;
+    case BLE_CMD_TEST_THROUGHPUT: {
+        // Send a known test pattern over mic notifications
+        size_t test_kb = (payload_len >= 1 && payload[0] > 0) ? payload[0] : 32;
+        ESP_LOGI(TAG, "Throughput test: %zu KB", test_kb);
+        ble_test_throughput(test_kb * 1024);
+        break;
+    }
     }
 }
 
