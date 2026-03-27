@@ -41,11 +41,13 @@ TTS_SAMPLE_RATE = 24000  # Matches ESP speaker; Opus compresses regardless of ra
 CARTESIA_VERSION = "2026-01-12"
 
 LLM_MODEL = "google/gemini-3.1-flash-lite-preview:nitro"
+LLM_VISION_MODEL = "google/gemini-3.1-pro-preview:nitro"  # vision-capable model
 LLM_MAX_TOKENS = 300
 
-SYSTEM_PROMPT = """You are a helpful AI voice assistant embedded in a wearable device.
-You receive spoken questions and respond conversationally.
-Keep answers to 1-3 sentences. Be direct, friendly, and concise — your response will be spoken aloud."""
+SYSTEM_PROMPT = """You are an assistive AI embedded in a wearable device for a vision-impaired user.
+You receive the user's spoken question and optionally an image from their camera.
+Respond concisely and helpfully — your response will be spoken aloud via TTS.
+Keep answers to 1-3 sentences. Be direct and descriptive about what you see."""
 
 # BLE UUIDs (must match ESP32 GATT service)
 SERVICE_UUID    = "87654321-4321-4321-4321-cba987654321"
@@ -191,13 +193,43 @@ async def stt_transcribe(audio_pcm):
     return transcript
 
 
-async def llm_query(transcript, history):
+# --- Image injection for camera-less mode ---
+_image_index = 0
+
+def get_next_image_b64():
+    """Get the next test image from input/ directory as base64. Returns None if no images."""
+    global _image_index
+    import glob as g
+    images = sorted(g.glob("input/*.jpg") + g.glob("input/*.jpeg") + g.glob("input/*.png"))
+    if not images:
+        return None
+    path = images[_image_index % len(images)]
+    _image_index += 1
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    log.info(f"[IMG] Injecting {path} ({len(data)//1024}KB) [{_image_index}/{len(images)}]")
+    return b64
+
+
+async def llm_query(transcript, history, image_b64=None):
     log.info(f"[LLM] \"{transcript[:80]}\"")
     t0 = time.time()
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
-    messages.append({"role": "user", "content": transcript})
+
+    # Build user message — with or without image
+    if image_b64:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": transcript},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ],
+        })
+    else:
+        messages.append({"role": "user", "content": transcript})
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -270,13 +302,26 @@ async def process_query_streaming(pcm_data, is_pcm, send_tts_cb):
     stt_time = time.time() - total_t0
     log.info(f"[STT] Done in {stt_time:.1f}s: \"{transcript}\"")
 
+    # Inject image if available in input/ directory
+    image_b64 = get_next_image_b64()
+    model = LLM_VISION_MODEL if image_b64 else LLM_MODEL
+
     # LLM streaming — get tokens as they arrive
-    log.info(f"[LLM] Streaming: \"{transcript[:80]}\"")
+    log.info(f"[LLM] Streaming: \"{transcript[:80]}\" (model={model.split('/')[-1]}, image={'yes' if image_b64 else 'no'})")
     llm_t0 = time.time()
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(conversation["history"])
-    messages.append({"role": "user", "content": transcript})
+    if image_b64:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": transcript},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ],
+        })
+    else:
+        messages.append({"role": "user", "content": transcript})
 
     full_response = ""
     sentence_buf = ""
@@ -371,7 +416,7 @@ async def process_query_streaming(pcm_data, is_pcm, send_tts_cb):
             "POST",
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": LLM_MODEL, "messages": messages, "max_tokens": LLM_MAX_TOKENS, "stream": True},
+            json={"model": model, "messages": messages, "max_tokens": LLM_MAX_TOKENS, "stream": True},
         ) as resp:
             first_token_time = None
             async for line in resp.aiter_lines():
