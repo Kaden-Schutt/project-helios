@@ -48,12 +48,15 @@ TTS_SAMPLE_RATE = 24000
 CARTESIA_VERSION = "2026-01-12"
 
 LLM_MODEL = "claude-haiku-4-5-20251001"
-LLM_MAX_TOKENS = 300
+LLM_MAX_TOKENS = 100
 
-SYSTEM_PROMPT = """You are an assistive AI embedded in a wearable device for a vision-impaired user.
-You receive the user's spoken question and optionally an image from their camera.
-Respond concisely and helpfully — your response will be spoken aloud via TTS.
-Keep answers to 1-3 sentences. Be direct and descriptive about what you see."""
+SYSTEM_PROMPT = """You are an assistive AI in a wearable for a vision-impaired user. Your response is spoken aloud via TTS.
+
+STRICT RULES:
+- Maximum 2 sentences. Never exceed 2 sentences.
+- Be direct. No filler, no hedging, no "I can see that..."
+- Describe what matters most to the user's safety or question.
+- If asked to identify something, name it immediately."""
 
 # BLE UUIDs
 SERVICE_UUID    = "87654321-4321-4321-4321-cba987654321"
