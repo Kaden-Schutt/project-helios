@@ -183,18 +183,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Initializing mic...");
     esp_err_t mic_ok = mic_init();
 
-    ESP_LOGI(TAG, "Initializing SD card...");
-    esp_err_t sd_ok = sdcard_init();
-
     ESP_LOGI(TAG, "Initializing camera...");
     esp_err_t cam_ok = camera_init();
 
-    // Load config
-    if (sd_ok == ESP_OK) {
-        config_load(&cfg);
-    } else {
-        config_defaults(&cfg);
-    }
+    // Load config from NVS
+    config_load(&cfg);
 
     button_init();
 
@@ -210,7 +203,6 @@ void app_main(void)
 
     printf("  Mic:     %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Speaker: deferred (init during playback)\n");
-    printf("  SD Card: %s\n", sd_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Camera:  %s\n", cam_ok == ESP_OK ? "OK" : "FAILED");
     printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
     printf("  TTS buf: %s\n", tts_buf ? "OK (256KB PSRAM)" : "FAILED");
@@ -228,7 +220,7 @@ void app_main(void)
         }
         button_idle_level = (high >= 5) ? 1 : 0;
         cfg.button_idle_level = button_idle_level;
-        if (sd_ok == ESP_OK) config_save(&cfg);
+        config_save(&cfg);
     }
 
     printf("  Waiting for BLE...\n");
@@ -304,8 +296,15 @@ void app_main(void)
             // Task handles: wait for watermark → speaker_init → streaming playback
             //   → speaker_deinit → camera_init + mic_init → spk_done_sem
             ESP_LOGI(TAG, "Spawning speaker task...");
-            xTaskCreatePinnedToCore(speaker_task, "spk", 32768,
-                                    (void *)(intptr_t)SPK_SAMPLE_RATE, 5, NULL, 0);
+            BaseType_t spk_rc = xTaskCreatePinnedToCore(
+                speaker_task, "spk", 32768,
+                (void *)(intptr_t)SPK_SAMPLE_RATE, 5, NULL, 0);
+            if (spk_rc != pdPASS) {
+                ESP_LOGE(TAG, "Speaker task creation failed! Restoring peripherals.");
+                camera_init();
+                mic_init();
+                xSemaphoreGive(spk_done_sem);
+            }
 
             // Wait for button release
             while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(50));
