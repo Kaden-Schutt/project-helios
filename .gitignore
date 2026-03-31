@@ -10,3 +10,4 @@ firmware/dependencies.lock
 firmware/compile_commands.json
 firmware/CMakeLists.txt
 output/
+.DS_Store
