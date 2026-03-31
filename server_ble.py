@@ -20,11 +20,17 @@ import numpy as np
 if os.path.exists("/opt/homebrew/lib"):
     os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")
 
+import argparse
+
 from bleak import BleakClient, BleakScanner
 from dotenv import load_dotenv
 import httpx
 import websockets
 import anthropic
+
+_parser = argparse.ArgumentParser(description="Helios BLE Voice + Vision Server")
+_parser.add_argument('--debug', action='store_true', help="Enable verbose logging")
+_args = _parser.parse_args()
 
 load_dotenv()
 
@@ -68,9 +74,13 @@ CMD_PLAYBACK_DONE   = 0x12
 
 CONVERSATION_TIMEOUT = 300
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.DEBUG if _args.debug else logging.WARNING,
+    format="%(asctime)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 logging.getLogger("bleak").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("helios")
 
@@ -460,9 +470,6 @@ class HeliosClient:
 
     def _on_mic_notify(self, sender, data: bytearray):
         """Demux multiplexed stream: JPEG (0xFFFFFFFE) then Opus (0xFFFFFFFF)."""
-        hdr = data[:4].hex() if len(data) >= 4 else data.hex()
-        log.debug(f"[MIC-RAW] {len(data)} bytes, hdr={hdr}, jpeg_recv={self.jpeg_receiving}, mic_recv={self.mic_receiving}, opus={self.mic_opus_mode}")
-
         # Empty = end of stream
         if len(data) == 0:
             if self.mic_opus_mode and self.opus_dec:
