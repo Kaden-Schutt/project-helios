@@ -12,6 +12,7 @@ import asyncio
 import struct
 import time
 import os
+import sys
 import json
 import logging
 import base64
@@ -68,9 +69,11 @@ CMD_CONNECTED       = 0x01
 CMD_PROCESSING      = 0x02
 CMD_SET_VOLUME      = 0x03
 CMD_ERROR           = 0x04
+CMD_REQUEST_STATUS  = 0x05
 CMD_BUTTON_PRESSED  = 0x10
 CMD_BUTTON_RELEASED = 0x11
 CMD_PLAYBACK_DONE   = 0x12
+CMD_DEVICE_STATUS   = 0x13
 
 CONVERSATION_TIMEOUT = 300
 
@@ -268,107 +271,108 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
     total_pcm = 0
     total_opus_sent = 0
 
-    try:
-        async with websockets.connect(uri) as ws:
-            await ws.send(request_msg)
-            log.info(f"[TTS-STREAM] Request sent (context={context_id[:8]})")
+    async with helios.ble_write_lock:
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(request_msg)
+                log.info(f"[TTS-STREAM] Request sent (context={context_id[:8]})")
 
-            async for msg in ws:
-                if not isinstance(msg, str):
-                    continue
+                async for msg in ws:
+                    if not isinstance(msg, str):
+                        continue
 
-                data = json.loads(msg)
-                msg_type = data.get("type", "")
+                    data = json.loads(msg)
+                    msg_type = data.get("type", "")
 
-                if msg_type == "chunk":
-                    # Decode base64 PCM chunk
-                    pcm_chunk = base64.b64decode(data.get("data", ""))
-                    pcm_accum.extend(pcm_chunk)
-                    total_pcm += len(pcm_chunk)
+                    if msg_type == "chunk":
+                        # Decode base64 PCM chunk
+                        pcm_chunk = base64.b64decode(data.get("data", ""))
+                        pcm_accum.extend(pcm_chunk)
+                        total_pcm += len(pcm_chunk)
 
-                    # Encode complete 20ms frames to Opus
-                    while len(pcm_accum) >= frame_bytes:
-                        pcm_frame = bytes(pcm_accum[:frame_bytes])
-                        del pcm_accum[:frame_bytes]
-                        opus_frame = enc.encode(pcm_frame, frame_samples)
-                        opus_buf.extend(struct.pack('<H', len(opus_frame)))
-                        opus_buf.extend(opus_frame)
+                        # Encode complete 20ms frames to Opus
+                        while len(pcm_accum) >= frame_bytes:
+                            pcm_frame = bytes(pcm_accum[:frame_bytes])
+                            del pcm_accum[:frame_bytes]
+                            opus_frame = enc.encode(pcm_frame, frame_samples)
+                            opus_buf.extend(struct.pack('<H', len(opus_frame)))
+                            opus_buf.extend(opus_frame)
 
-                    # Watermark: start streaming over BLE
-                    if not streaming and len(opus_buf) >= TTS_STREAM_WATERMARK:
-                        streaming = True
-                        log.info(f"[TTS-STREAM] Watermark reached ({len(opus_buf)} bytes), "
-                                 f"starting BLE stream")
-                        # Send start marker
-                        await helios.client.write_gatt_char(
-                            SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
-                        # Send buffered data
-                        offset = 0
-                        while offset < len(opus_buf):
-                            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                        # Watermark: start streaming over BLE
+                        if not streaming and len(opus_buf) >= TTS_STREAM_WATERMARK:
+                            streaming = True
+                            log.info(f"[TTS-STREAM] Watermark reached ({len(opus_buf)} bytes), "
+                                     f"starting BLE stream")
+                            # Send start marker
                             await helios.client.write_gatt_char(
-                                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
-                            offset = end
-                        total_opus_sent += len(opus_buf)
-                        opus_buf.clear()
+                                SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
+                            # Send buffered data
+                            offset = 0
+                            while offset < len(opus_buf):
+                                end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                                await helios.client.write_gatt_char(
+                                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                                offset = end
+                            total_opus_sent += len(opus_buf)
+                            opus_buf.clear()
 
-                    # In streaming mode, send new opus data as it arrives
-                    elif streaming and len(opus_buf) > 0:
-                        offset = 0
-                        while offset < len(opus_buf):
-                            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
-                            await helios.client.write_gatt_char(
-                                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
-                            offset = end
-                        total_opus_sent += len(opus_buf)
-                        opus_buf.clear()
+                        # In streaming mode, send new opus data as it arrives
+                        elif streaming and len(opus_buf) > 0:
+                            offset = 0
+                            while offset < len(opus_buf):
+                                end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                                await helios.client.write_gatt_char(
+                                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                                offset = end
+                            total_opus_sent += len(opus_buf)
+                            opus_buf.clear()
 
-                elif msg_type == "done":
-                    break
+                    elif msg_type == "done":
+                        break
 
-                elif msg_type == "error":
-                    log.error(f"[TTS-STREAM] Cartesia error: {data}")
-                    break
+                    elif msg_type == "error":
+                        log.error(f"[TTS-STREAM] Cartesia error: {data}")
+                        break
 
-    except Exception as e:
-        log.error(f"[TTS-STREAM] WebSocket error: {e}")
+        except Exception as e:
+            log.error(f"[TTS-STREAM] WebSocket error: {e}")
+            if not streaming:
+                # Fallback to batch if streaming never started
+                log.info("[TTS-STREAM] Falling back to batch TTS")
+                tts_pcm = await tts_synthesize(text)
+                if tts_pcm:
+                    opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
+                    await helios.send_tts(opus_data)
+                return
+
+        # Encode any remaining PCM (pad to full frame)
+        if len(pcm_accum) > 0:
+            pcm_accum.extend(b'\x00' * (frame_bytes - len(pcm_accum)))
+            opus_frame = enc.encode(bytes(pcm_accum), frame_samples)
+            opus_buf.extend(struct.pack('<H', len(opus_frame)))
+            opus_buf.extend(opus_frame)
+
+        # Append Opus end marker
+        opus_buf.extend(struct.pack('<H', 0))
+
         if not streaming:
-            # Fallback to batch if streaming never started
-            log.info("[TTS-STREAM] Falling back to batch TTS")
-            tts_pcm = await tts_synthesize(text)
-            if tts_pcm:
-                opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
-                await helios.send_tts(opus_data)
-            return
-
-    # Encode any remaining PCM (pad to full frame)
-    if len(pcm_accum) > 0:
-        pcm_accum.extend(b'\x00' * (frame_bytes - len(pcm_accum)))
-        opus_frame = enc.encode(bytes(pcm_accum), frame_samples)
-        opus_buf.extend(struct.pack('<H', len(opus_frame)))
-        opus_buf.extend(opus_frame)
-
-    # Append Opus end marker
-    opus_buf.extend(struct.pack('<H', 0))
-
-    if not streaming:
-        # Never reached watermark — send everything now
-        await helios.client.write_gatt_char(
-            SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
-
-    # Send remaining data
-    if len(opus_buf) > 0:
-        offset = 0
-        while offset < len(opus_buf):
-            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+            # Never reached watermark — send everything now
             await helios.client.write_gatt_char(
-                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
-            offset = end
-        total_opus_sent += len(opus_buf)
+                SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
 
-    # Empty end marker
-    await asyncio.sleep(0.02)
-    await helios.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
+        # Send remaining data
+        if len(opus_buf) > 0:
+            offset = 0
+            while offset < len(opus_buf):
+                end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                await helios.client.write_gatt_char(
+                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                offset = end
+            total_opus_sent += len(opus_buf)
+
+        # Empty end marker
+        await asyncio.sleep(0.02)
+        await helios.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
 
     elapsed = time.time() - t0
     duration = total_pcm / 2 / TTS_SAMPLE_RATE
@@ -382,6 +386,7 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
 class HeliosClient:
     def __init__(self):
         self.client = None
+        self.ble_write_lock = asyncio.Lock()
         # Mic stream state
         self.mic_buffer = bytearray()
         self.mic_receiving = False
@@ -569,6 +574,11 @@ class HeliosClient:
                 self.query_event.set()
         elif cmd == CMD_PLAYBACK_DONE:
             log.info("[ESP32] Playback finished")
+        elif cmd == CMD_DEVICE_STATUS:
+            if len(data) >= 4:  # cmd byte + 3 payload bytes
+                vol = data[1]
+                heap_kb = data[2] | (data[3] << 8)
+                print(f"  [ESP32] Volume: {vol}%, Heap: {heap_kb}KB, BLE: connected")
 
     async def connect(self):
         log.info("Scanning for Helios...")
@@ -610,78 +620,130 @@ class HeliosClient:
 
     async def send_tts(self, opus_data: bytes):
         """Send Opus TTS data to ESP: start marker + data chunks + empty end."""
-        total_len = len(opus_data)
+        async with self.ble_write_lock:
+            total_len = len(opus_data)
 
-        # Start marker (mirrors mic→Pi Opus protocol)
-        header = b'\xFF\xFF\xFF\xFF'
-        await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=True)
+            # Start marker (mirrors mic→Pi Opus protocol)
+            header = b'\xFF\xFF\xFF\xFF'
+            await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=True)
 
-        # Data chunks — response=True guarantees delivery (no silent drops)
-        offset = 0
-        chunks = 0
-        while offset < total_len:
-            end = min(offset + BLE_CHUNK_SIZE, total_len)
-            chunk = opus_data[offset:end]
-            await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=True)
-            offset = end
-            chunks += 1
+            # Data chunks — response=True guarantees delivery (no silent drops)
+            offset = 0
+            chunks = 0
+            while offset < total_len:
+                end = min(offset + BLE_CHUNK_SIZE, total_len)
+                chunk = opus_data[offset:end]
+                await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=True)
+                offset = end
+                chunks += 1
 
-        # Empty end marker
-        await asyncio.sleep(0.02)
-        await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
-        log.info(f"[TX] Sent {total_len:,} bytes Opus in {chunks} BLE chunks")
+            # Empty end marker
+            await asyncio.sleep(0.02)
+            await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
+            log.info(f"[TX] Sent {total_len:,} bytes Opus in {chunks} BLE chunks")
+
+    async def cli_loop(self):
+        """Read CLI commands from stdin."""
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+        while self.client and self.client.is_connected:
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if not line:
+                break
+            cmd = line.decode().strip().lower()
+            if not cmd:
+                continue
+
+            if cmd.startswith("vol "):
+                try:
+                    val = int(cmd.split()[1])
+                    val = max(0, min(100, val))
+                    async with self.ble_write_lock:
+                        await self.client.write_gatt_char(
+                            CONTROL_UUID, bytes([CMD_SET_VOLUME, val]), response=False)
+                    print(f"  [SET] Volume -> {val}%")
+                except (ValueError, IndexError):
+                    print("  Usage: vol <0-100>")
+
+            elif cmd == "status":
+                async with self.ble_write_lock:
+                    await self.client.write_gatt_char(
+                        CONTROL_UUID, bytes([CMD_REQUEST_STATUS]), response=False)
+
+            elif cmd == "clear":
+                turns = len([m for m in conversation["history"] if m["role"] == "user"])
+                conversation["history"] = []
+                conversation["last_time"] = 0.0
+                print(f"  [CONV] Cleared {turns} turns")
+
+            elif cmd == "help":
+                print("  Commands: vol <0-100>, status, clear, help")
+
+            else:
+                print(f"  Unknown command: {cmd}. Type 'help' for commands.")
 
     async def run(self):
         log.info("Waiting for button press...\n")
+        cli_task = asyncio.create_task(self.cli_loop())
 
-        while self.client.is_connected:
-            self.query_event.clear()
-            try:
-                await asyncio.wait_for(self.query_event.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+        try:
+            while self.client.is_connected:
+                self.query_event.clear()
+                try:
+                    await asyncio.wait_for(self.query_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
 
-            if len(self.mic_buffer) == 0:
-                continue
+                if len(self.mic_buffer) == 0:
+                    continue
 
-            t0 = time.time()
-            dur = len(self.mic_buffer) / 2 / STT_SAMPLE_RATE
-            log.info(f"Query: {len(self.mic_buffer):,} bytes PCM ({dur:.1f}s), "
-                     f"JPEG={'yes' if self.jpeg_b64 else 'no'}")
+                t0 = time.time()
+                dur = len(self.mic_buffer) / 2 / STT_SAMPLE_RATE
+                log.info(f"Query: {len(self.mic_buffer):,} bytes PCM ({dur:.1f}s), "
+                         f"JPEG={'yes' if self.jpeg_b64 else 'no'}")
 
-            # Finalize STT
-            transcript = await self._finalize_stt()
-            stt_time = time.time() - t0
-            if not transcript.strip():
-                transcript = "Hello"
-                log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
-            else:
-                log.info(f"[STT] {stt_time:.1f}s: \"{transcript}\"")
+                # Finalize STT
+                transcript = await self._finalize_stt()
+                stt_time = time.time() - t0
+                if not transcript.strip():
+                    transcript = "Hello"
+                    log.warning(f"[STT] Empty, fallback: \"{transcript}\"")
+                else:
+                    log.info(f"[STT] {stt_time:.1f}s: \"{transcript}\"")
 
-            # Signal processing
-            await self.client.write_gatt_char(
-                CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
+                # Signal processing
+                async with self.ble_write_lock:
+                    await self.client.write_gatt_char(
+                        CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
 
-            # Conversation timeout
-            if conversation["history"] and time.time() - conversation["last_time"] > CONVERSATION_TIMEOUT:
-                log.info("[CONV] Expired -- clearing")
-                conversation["history"] = []
+                # Conversation timeout
+                if conversation["history"] and time.time() - conversation["last_time"] > CONVERSATION_TIMEOUT:
+                    log.info("[CONV] Expired -- clearing")
+                    conversation["history"] = []
 
-            # LLM query (with optional JPEG)
-            response_text = await llm_query(
-                transcript, conversation["history"], self.jpeg_b64)
+                # LLM query (with optional JPEG)
+                response_text = await llm_query(
+                    transcript, conversation["history"], self.jpeg_b64)
 
-            # Update conversation
-            conversation["history"].append({"role": "user", "content": transcript})
-            conversation["history"].append({"role": "assistant", "content": response_text})
-            conversation["last_time"] = time.time()
+                # Update conversation
+                conversation["history"].append({"role": "user", "content": transcript})
+                conversation["history"].append({"role": "assistant", "content": response_text})
+                conversation["last_time"] = time.time()
 
-            # TTS → Opus → BLE (streaming)
-            await tts_stream_and_send(response_text, self)
+                # TTS → Opus → BLE (streaming)
+                await tts_stream_and_send(response_text, self)
 
-            total = time.time() - t0
-            log.info(f"[TOTAL] {total:.1f}s | \"{response_text[:60]}\"")
-            log.info("Waiting for next button press...\n")
+                total = time.time() - t0
+                log.info(f"[TOTAL] {total:.1f}s | \"{response_text[:60]}\"")
+                log.info("Waiting for next button press...\n")
+        finally:
+            cli_task.cancel()
 
 
 async def main():
@@ -700,7 +762,7 @@ async def main():
     print(f"  LLM:   {LLM_MODEL}")
     print(f"  TTS:   {TTS_MODEL} @ {TTS_SAMPLE_RATE}Hz")
     print(f"  Voice: {TTS_VOICE_ID}")
-    print()
+    print(f"  Type 'help' for commands.\n")
 
     helios = HeliosClient()
 
