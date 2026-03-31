@@ -48,12 +48,12 @@ TTS_SAMPLE_RATE = 24000
 CARTESIA_VERSION = "2026-01-12"
 
 LLM_MODEL = "claude-haiku-4-5-20251001"
-LLM_MAX_TOKENS = 100
+LLM_MAX_TOKENS = 150
 
 SYSTEM_PROMPT = """You are an assistive AI in a wearable for a vision-impaired user. Your response is spoken aloud via TTS.
 
 STRICT RULES:
-- Maximum 2 sentences. Never exceed 2 sentences.
+- Maximum 3 sentences. Never exceed 3 sentences.
 - Be direct. No filler, no hedging, no "I can see that..."
 - Describe what matters most to the user's safety or question.
 - If asked to identify something, name it immediately."""
