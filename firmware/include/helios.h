@@ -74,6 +74,7 @@ esp_err_t speaker_stop(void);
 #define BLE_CMD_PROCESSING      0x02
 #define BLE_CMD_SET_VOLUME      0x03
 #define BLE_CMD_ERROR           0x04
+#define BLE_CMD_REQUEST_STATUS  0x05
 
 // Control commands (ESP → Pi)
 #define BLE_CMD_BUTTON_PRESSED  0x10
