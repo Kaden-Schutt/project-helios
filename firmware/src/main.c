@@ -1,8 +1,9 @@
 /*
- * Helios Firmware — BLE Voice Assistant
- * =======================================
- * Button hold → mic records to SD → BLE sends PCM to Pi
- * Pi runs STT→LLM→TTS → BLE sends TTS back → speaker plays
+ * Helios Firmware — BLE Voice + Vision Assistant
+ * ================================================
+ * Button hold → camera JPEG + mic Opus stream over BLE
+ * Pi runs STT→LLM(vision)→TTS → BLE sends Opus TTS back
+ * Speaker plays TTS on Core 1 (non-blocking)
  */
 
 #include <stdio.h>
@@ -23,13 +24,14 @@ static const char *TAG = "helios";
 
 #define BUTTON_GPIO     GPIO_NUM_4
 
-// TTS receive buffer (256KB in PSRAM, ~8s at 24kHz 16-bit)
+// TTS receive buffer (256KB in PSRAM)
 #define TTS_BUF_SIZE    (256 * 1024)
 static uint8_t *tts_buf = NULL;
 static volatile size_t tts_received = 0;
 static volatile size_t tts_expected = 0;
 static volatile bool tts_done = false;
 static SemaphoreHandle_t tts_sem = NULL;
+static SemaphoreHandle_t spk_done_sem = NULL;  // signalled when speaker_task finishes
 
 // Config
 static helios_config_t cfg;
@@ -53,6 +55,25 @@ static bool button_pressed(void)
     return gpio_get_level(BUTTON_GPIO) != button_idle_level;
 }
 
+// --- Speaker task (runs on Core 1) ---
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    int sample_rate;
+} spk_args_t;
+
+static void speaker_task(void *arg)
+{
+    spk_args_t *a = (spk_args_t *)arg;
+    ESP_LOGI(TAG, "Speaker task: playing %zu bytes Opus on Core 1", a->len);
+    speaker_play_opus(a->data, a->len, a->sample_rate);
+    ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
+    ESP_LOGI(TAG, "Playback done");
+    free(a);
+    xSemaphoreGive(spk_done_sem);  // signal: safe to reuse tts_buf
+    vTaskDelete(NULL);
+}
+
 // --- BLE Callbacks ---
 static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is_last)
 {
@@ -60,18 +81,16 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
         tts_expected = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
         tts_received = 0;
         tts_done = false;
-        if (tts_expected == 0xFFFFFFFF) {
-            ESP_LOGI(TAG, "TTS streaming mode (size unknown)");
-        } else {
-            ESP_LOGI(TAG, "TTS incoming: %zu bytes", tts_expected);
-        }
+        ESP_LOGI(TAG, "TTS incoming: %zu bytes", tts_expected);
         data += 4;
         len -= 4;
     }
 
     if (is_last) {
-        tts_done = true;
-        xSemaphoreGive(tts_sem);
+        if (!tts_done) {
+            tts_done = true;
+            xSemaphoreGive(tts_sem);
+        }
         return;
     }
 
@@ -80,7 +99,7 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
         tts_received += len;
     }
 
-    if (tts_received >= tts_expected && tts_expected > 0) {
+    if (!tts_done && tts_received >= tts_expected && tts_expected > 0) {
         tts_done = true;
         xSemaphoreGive(tts_sem);
     }
@@ -105,20 +124,13 @@ static void on_control(uint8_t cmd, const uint8_t *payload, size_t payload_len)
     case BLE_CMD_ERROR:
         ESP_LOGW(TAG, "Pi error: %.*s", (int)payload_len, (const char *)payload);
         break;
-    case BLE_CMD_TEST_THROUGHPUT: {
-        // Send a known test pattern over mic notifications
-        size_t test_kb = (payload_len >= 1 && payload[0] > 0) ? payload[0] : 32;
-        ESP_LOGI(TAG, "Throughput test: %zu KB", test_kb);
-        ble_test_throughput(test_kb * 1024);
-        break;
-    }
     }
 }
 
 void app_main(void)
 {
     printf("\n========================================\n");
-    printf("  HELIOS — BLE Voice Assistant\n");
+    printf("  HELIOS — BLE Voice + Vision Assistant\n");
     printf("========================================\n\n");
 
     // Init peripherals
@@ -130,6 +142,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Initializing SD card...");
     esp_err_t sd_ok = sdcard_init();
+
+    ESP_LOGI(TAG, "Initializing camera...");
+    esp_err_t cam_ok = camera_init();
 
     // Load config
     if (sd_ok == ESP_OK) {
@@ -143,6 +158,8 @@ void app_main(void)
 
     // Init BLE
     tts_sem = xSemaphoreCreateBinary();
+    spk_done_sem = xSemaphoreCreateBinary();
+    xSemaphoreGive(spk_done_sem);  // start as "available" (no speaker running)
     tts_buf = heap_caps_malloc(TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG, "Initializing BLE...");
@@ -151,6 +168,7 @@ void app_main(void)
     printf("  Mic:     %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Speaker: %s\n", spk_ok == ESP_OK ? "OK" : "FAILED");
     printf("  SD Card: %s\n", sd_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  Camera:  %s\n", cam_ok == ESP_OK ? "OK" : "FAILED");
     printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
     printf("  TTS buf: %s\n", tts_buf ? "OK (256KB PSRAM)" : "FAILED");
     printf("  Volume:  %d%%\n", cfg.speaker_volume);
@@ -193,7 +211,6 @@ void app_main(void)
     while (!ble_is_connected()) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    // Give BLE stack time to finish service discovery + subscription
     vTaskDelay(pdMS_TO_TICKS(2000));
     printf("  Connected! Hold button to talk.\n\n");
 
@@ -206,34 +223,71 @@ void app_main(void)
         }
 
         if (button_pressed()) {
+            // Debounce
             vTaskDelay(pdMS_TO_TICKS(100));
             if (!button_pressed()) goto poll;
 
-            ESP_LOGI(TAG, "LISTENING...");
-            ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
+            ESP_LOGI(TAG, "=== QUERY START ===");
 
-            // Stream mic → Opus encode → BLE in real-time
-            if (mic_ok == ESP_OK) {
-                ble_stream_mic_opus(button_pressed, 30000);
-            }
+            // Wait for any previous speaker playback to finish before
+            // touching tts_buf (prevents corruption if user presses
+            // button while TTS is still playing). Must block until
+            // done — tts_buf is shared, no safe timeout.
+            xSemaphoreTake(spk_done_sem, portMAX_DELAY);
 
-            ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
-
-            // Wait for TTS response
-            ESP_LOGI(TAG, "Waiting for TTS...");
+            // Reset TTS state BEFORE any BLE communication —
+            // the Pi can't send TTS until it receives our mic data,
+            // so this is safe. Resetting after button release is NOT
+            // safe because the Pi might respond before we reset.
             tts_received = 0;
             tts_expected = 0;
             tts_done = false;
+            // Drain any stale semaphore signal from previous query
+            // (on_tts_chunk could have given it at size threshold)
+            xSemaphoreTake(tts_sem, 0);
 
-            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(60000)) == pdTRUE && tts_received > 0) {
-                ESP_LOGI(TAG, "Playing Opus TTS (%zu bytes)...", tts_received);
-                if (spk_ok == ESP_OK) {
-                    speaker_play_opus(tts_buf, tts_received, SPK_SAMPLE_RATE);
+            // 1. Notify Pi: button pressed
+            ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
+
+            // 2. Camera JPEG capture + send (~130ms)
+            if (cam_ok == ESP_OK) {
+                uint8_t *jpeg_buf = NULL;
+                size_t jpeg_len = 0;
+                if (camera_capture_jpeg(&jpeg_buf, &jpeg_len) == ESP_OK) {
+                    ESP_LOGI(TAG, "JPEG: %zu bytes, sending...", jpeg_len);
+                    ble_send_jpeg(jpeg_buf, jpeg_len);
+                    camera_return_fb();
+                } else {
+                    ESP_LOGW(TAG, "Camera capture failed");
                 }
-                ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
-                ESP_LOGI(TAG, "Done.");
+            }
+
+            // 3. Stream mic Opus until button released
+            ESP_LOGI(TAG, "LISTENING...");
+            ble_stream_mic_opus(button_pressed, 30000);
+
+            // 4. Notify Pi: button released
+            ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
+
+            // 5. Wait for TTS response
+            ESP_LOGI(TAG, "Waiting for TTS...");
+            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(60000)) == pdTRUE && tts_received > 0) {
+                ESP_LOGI(TAG, "TTS received: %zu bytes, spawning speaker on Core 1", tts_received);
+
+                // 6. Play on Core 1 (non-blocking)
+                spk_args_t *args = malloc(sizeof(spk_args_t));
+                if (args) {
+                    args->data = tts_buf;
+                    args->len = tts_received;
+                    args->sample_rate = SPK_SAMPLE_RATE;
+                    xTaskCreatePinnedToCore(speaker_task, "spk", 8192,
+                                            args, 5, NULL, 1);
+                } else {
+                    xSemaphoreGive(spk_done_sem);  // no task spawned
+                }
             } else {
                 ESP_LOGW(TAG, "No TTS received (timeout)");
+                xSemaphoreGive(spk_done_sem);  // no playback needed
             }
 
             // Wait for button release

@@ -29,7 +29,6 @@
 #define MIC_DATA_PIN    41
 #define MIC_SAMPLE_RATE     16000
 #define MIC_BIT_DEPTH       16
-#define MIC_BLE_SAMPLE_RATE 8000   // Downsampled for BLE transport
 
 // --- Camera API ---
 esp_err_t camera_init(void);
@@ -41,10 +40,6 @@ void      camera_deinit(void);
 typedef bool (*mic_keep_recording_fn)(void);
 esp_err_t mic_init(void);
 esp_err_t mic_record(int duration_ms, uint8_t **out_buf, size_t *out_len);
-esp_err_t mic_record_while(mic_keep_recording_fn keep_going, int max_ms,
-                           uint8_t **out_buf, size_t *out_len);
-esp_err_t mic_record_to_file(mic_keep_recording_fn keep_going, int max_ms,
-                             const char *path, size_t *out_len);
 void      mic_free_buf(uint8_t *buf);
 
 // --- SD Card (onboard Sense board slot, SPI mode) ---
@@ -64,7 +59,6 @@ bool      sdcard_is_mounted(void);
 #define SPK_BCLK_PIN    6   // D5 — bit clock
 #define SPK_DIN_PIN     43  // D6 — data in
 #define SPK_SAMPLE_RATE     24000
-#define TTS_BLE_SAMPLE_RATE 8000   // TTS sample rate for BLE transport
 // Max PCM scale factor before amp clips (5V supply, GAIN=GND +15dB, 8Ω load)
 // +15dB = 5.62x gain. At 5V BTL max ~4.6V peak differential.
 // Full-scale would produce ~5.0V peak → clip. Safe ceiling ~0.90.
@@ -75,8 +69,6 @@ esp_err_t speaker_init(void);
 void      speaker_set_volume(int percent);  // 0-100
 int       speaker_get_volume(void);
 esp_err_t speaker_play(const uint8_t *pcm_s16, size_t len);
-esp_err_t speaker_play_8k(const uint8_t *pcm_s16_8k, size_t len);
-esp_err_t speaker_play_ulaw(const uint8_t *ulaw_data, size_t len, int src_sample_rate);
 esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample_rate);
 esp_err_t speaker_stop(void);
 
@@ -96,7 +88,6 @@ esp_err_t speaker_stop(void);
 #define BLE_CMD_BUTTON_RELEASED 0x11
 #define BLE_CMD_PLAYBACK_DONE   0x12
 #define BLE_CMD_DEVICE_STATUS   0x13
-#define BLE_CMD_TEST_THROUGHPUT 0x20  // Pi requests throughput test
 
 // Callbacks
 typedef void (*ble_tts_chunk_cb)(const uint8_t *data, size_t len, bool is_first, bool is_last);
@@ -105,11 +96,9 @@ typedef void (*ble_control_cb)(uint8_t cmd, const uint8_t *payload, size_t paylo
 // --- BLE API ---
 esp_err_t ble_init(ble_tts_chunk_cb tts_cb, ble_control_cb ctrl_cb);
 bool      ble_is_connected(void);
-esp_err_t ble_send_mic_data(const uint8_t *pcm, size_t len);
-esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len);
+esp_err_t ble_send_jpeg(const uint8_t *jpeg, size_t len);
 esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms);
 esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload_len);
-esp_err_t ble_test_throughput(size_t total_bytes);
 void      ble_start_advertising(void);
 
 // --- Config (persistent JSON on SD card) ---

@@ -16,28 +16,10 @@
 #include <string.h>
 #include <stdio.h>
 
+// Mic I2S channel (defined in mic.c, non-static)
+extern i2s_chan_handle_t s_rx_chan;
+
 static const char *TAG = "ble";
-
-// µ-law encode: 16-bit signed PCM → 8-bit µ-law
-static uint8_t pcm_to_ulaw(int16_t sample)
-{
-    const int BIAS = 0x84;
-    const int MAX = 0x7FFF;
-    int sign, exponent, mantissa;
-    uint8_t ulawbyte;
-
-    sign = (sample >> 8) & 0x80;
-    if (sign) sample = -sample;
-    if (sample > MAX) sample = MAX;
-    sample += BIAS;
-
-    exponent = 7;
-    for (int expMask = 0x4000; (sample & expMask) == 0 && exponent > 0; exponent--, expMask >>= 1) {}
-
-    mantissa = (sample >> (exponent + 3)) & 0x0F;
-    ulawbyte = ~(sign | (exponent << 4) | mantissa);
-    return ulawbyte;
-}
 
 // --- State ---
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -47,7 +29,6 @@ static bool s_mic_notify_enabled = false;
 static bool s_ctrl_notify_enabled = false;
 static ble_tts_chunk_cb s_tts_cb = NULL;
 static ble_control_cb s_ctrl_cb = NULL;
-static SemaphoreHandle_t s_notify_sem = NULL;
 static bool s_tts_first_write = true;
 static uint8_t s_own_addr_type = 0;
 
@@ -163,25 +144,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             s_conn_handle = event->connect.conn_handle;
             s_tts_first_write = true;
             ESP_LOGI(TAG, "Connected (handle=%d)", s_conn_handle);
-
-            // Request 2M PHY for higher throughput
-            ble_gap_set_prefered_le_phy(s_conn_handle,
-                BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK,
-                BLE_GAP_LE_PHY_CODED_ANY);
-
-            // Request max DLE (251 byte PDUs)
-            ble_att_set_preferred_mtu(BLE_MTU);
-
-            // Request tight connection interval (7.5ms min, 15ms max)
-            struct ble_gap_upd_params conn_params = {
-                .itvl_min = 6,      // 7.5ms (6 × 1.25ms)
-                .itvl_max = 12,     // 15ms
-                .latency = 0,
-                .supervision_timeout = 500, // 5 seconds
-                .min_ce_len = 0,
-                .max_ce_len = 0,
-            };
-            ble_gap_update_params(s_conn_handle, &conn_params);
         } else {
             ESP_LOGW(TAG, "Connection failed: %d", event->connect.status);
             ble_start_advertising();
@@ -212,19 +174,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_TX:
         break;
-
-    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
-        ESP_LOGI(TAG, "PHY updated: TX=%d RX=%d (1=1M, 2=2M, 3=Coded)",
-                 event->phy_updated.tx_phy, event->phy_updated.rx_phy);
-        break;
-
-    case BLE_GAP_EVENT_CONN_UPDATE: {
-        struct ble_gap_conn_desc desc;
-        ble_gap_conn_find(event->conn_update.conn_handle, &desc);
-        ESP_LOGI(TAG, "Conn params updated: interval=%d latency=%d",
-                 desc.conn_itvl, desc.conn_latency);
-        break;
-    }
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption changed: status=%d", event->enc_change.status);
@@ -280,11 +229,7 @@ static void ble_on_sync(void)
         ESP_LOGE(TAG, "id_infer_auto failed: %d", rc);
         return;
     }
-    // Set default preferred PHY to 2M for all future connections
-    ble_gap_set_prefered_default_le_phy(
-        BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK);
-
-    ESP_LOGI(TAG, "BLE host synced (addr_type=%d, 2M PHY preferred), starting advertising...", s_own_addr_type);
+    ESP_LOGI(TAG, "BLE host synced (addr_type=%d), starting advertising...", s_own_addr_type);
     ble_start_advertising();
 }
 
@@ -346,9 +291,6 @@ esp_err_t ble_init(ble_tts_chunk_cb tts_cb, ble_control_cb ctrl_cb)
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sync_cb = ble_on_sync;
 
-    // Flow control semaphore (allow 10 outstanding notifications)
-    s_notify_sem = xSemaphoreCreateCounting(10, 10);
-
     // Start host task
     nimble_port_freertos_init(ble_host_task);
 
@@ -359,298 +301,6 @@ esp_err_t ble_init(ble_tts_chunk_cb tts_cb, ble_control_cb ctrl_cb)
 bool ble_is_connected(void)
 {
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
-}
-
-esp_err_t ble_send_mic_data(const uint8_t *pcm, size_t len)
-{
-    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
-
-    // Send 4-byte size header
-    uint8_t hdr[4] = {
-        (len >>  0) & 0xFF, (len >>  8) & 0xFF,
-        (len >> 16) & 0xFF, (len >> 24) & 0xFF,
-    };
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 4);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    // Send data chunks
-    size_t sent = 0;
-    while (sent < len) {
-        size_t chunk = len - sent;
-        if (chunk > BLE_CHUNK_SIZE) chunk = BLE_CHUNK_SIZE;
-
-        om = ble_hs_mbuf_from_flat(pcm + sent, chunk);
-        if (om) {
-            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                // BLE stack congested — wait and retry
-                os_mbuf_free_chain(om);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            if (rc != 0) {
-                ESP_LOGW(TAG, "Notify failed at %zu/%zu: %d", sent, len, rc);
-                os_mbuf_free_chain(om);
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-        }
-        sent += chunk;
-        // Pace notifications to avoid congestion
-        if (sent % (BLE_CHUNK_SIZE * 4) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    // Zero-length end marker
-    om = ble_hs_mbuf_from_flat(NULL, 0);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    ESP_LOGI(TAG, "Sent %zu bytes mic PCM", sent);
-    return ESP_OK;
-}
-
-esp_err_t ble_send_mic_data_from_file(const char *path, size_t file_len)
-{
-    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
-
-    FILE *f = fopen(path, "rb");
-    if (!f) return ESP_FAIL;
-
-    // µ-law encoded size = half of original (16-bit → 8-bit)
-    size_t ulaw_total = file_len / 2;
-
-    // Send 4-byte size header with µ-law encoded size
-    uint8_t hdr[4] = {
-        (ulaw_total >>  0) & 0xFF, (ulaw_total >>  8) & 0xFF,
-        (ulaw_total >> 16) & 0xFF, (ulaw_total >> 24) & 0xFF,
-    };
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 4);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    // Read 16kHz s16le from file, µ-law encode to 8-bit, send over BLE
-    uint8_t read_buf[1024];           // 512 samples of s16le
-    uint8_t send_buf[BLE_CHUNK_SIZE];
-    size_t send_pos = 0;
-    size_t sent = 0;
-    size_t file_read = 0;
-
-    while (file_read < file_len) {
-        size_t to_read = file_len - file_read;
-        if (to_read > sizeof(read_buf)) to_read = sizeof(read_buf);
-        to_read &= ~1;  // align to sample boundary
-        size_t n = fread(read_buf, 1, to_read, f);
-        if (n == 0) break;
-        file_read += n;
-
-        // µ-law encode with DC offset removal: 2 bytes in → 1 byte out
-        int16_t *samples = (int16_t *)read_buf;
-        size_t n_samples = n / 2;
-        // Compute DC offset of this chunk
-        int32_t sum = 0;
-        for (size_t i = 0; i < n_samples; i++) sum += samples[i];
-        int16_t dc = (int16_t)(sum / (int32_t)n_samples);
-
-        for (size_t i = 0; i < n_samples; i++) {
-            int16_t centered = samples[i] - dc;
-            send_buf[send_pos++] = pcm_to_ulaw(centered);
-
-            if (send_pos >= BLE_CHUNK_SIZE) {
-                int retries = 0;
-                while (retries < 50) {
-                    om = ble_hs_mbuf_from_flat(send_buf, send_pos);
-                    if (!om) { vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue; }
-                    int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-                    if (rc == 0) break;
-                    if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                        vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue;
-                    }
-                    ESP_LOGW(TAG, "Notify error at %zu: %d", sent, rc);
-                    break;
-                }
-                sent += send_pos;
-                send_pos = 0;
-                vTaskDelay(pdMS_TO_TICKS(5));
-            }
-        }
-    }
-
-    // Flush remaining
-    if (send_pos > 0) {
-        int retries = 0;
-        while (retries < 50) {
-            om = ble_hs_mbuf_from_flat(send_buf, send_pos);
-            if (!om) { vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue; }
-            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == 0) break;
-            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                vTaskDelay(pdMS_TO_TICKS(20)); retries++; continue;
-            }
-            break;
-        }
-        sent += send_pos;
-    }
-
-    // End marker
-    vTaskDelay(pdMS_TO_TICKS(100));
-    om = ble_hs_mbuf_from_flat(NULL, 0);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    fclose(f);
-    ESP_LOGI(TAG, "Sent %zu bytes µ-law (from %zu bytes PCM) from %s", sent, file_len, path);
-    return ESP_OK;
-}
-
-esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms)
-{
-    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
-
-    // Create Opus encoder
-    int opus_err;
-    OpusEncoder *enc = opus_encoder_create(MIC_SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_err);
-    if (!enc || opus_err != OPUS_OK) {
-        ESP_LOGE(TAG, "Opus encoder create failed: %d", opus_err);
-        return ESP_FAIL;
-    }
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(16000));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(3));  // low complexity for real-time
-
-    // I2S mic channel — get from mic.c (it's already initialized and enabled)
-    extern i2s_chan_handle_t s_rx_chan;  // from mic.c
-
-    // 20ms frame at 16kHz = 320 samples = 640 bytes PCM
-    const int frame_samples = MIC_SAMPLE_RATE / 50;  // 320
-    const int frame_bytes = frame_samples * 2;         // 640
-    int16_t *pcm_frame = heap_caps_malloc(frame_bytes, MALLOC_CAP_SPIRAM);
-    uint8_t *opus_out = malloc(256);  // max Opus frame size
-    if (!pcm_frame || !opus_out) {
-        ESP_LOGE(TAG, "Alloc failed for Opus stream buffers");
-        if (pcm_frame) free(pcm_frame);
-        if (opus_out) free(opus_out);
-        opus_encoder_destroy(enc);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Send a "start" marker: 4 bytes with 0xFFFFFFFF to signal Opus stream mode
-    uint8_t start_marker[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(start_marker, 4);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    size_t frames_sent = 0;
-    size_t total_opus_bytes = 0;
-    size_t min_bytes = (MIC_SAMPLE_RATE * 2 * 500) / 1000;  // 500ms minimum
-    size_t total_pcm_read = 0;
-    size_t max_bytes = (MIC_SAMPLE_RATE * 2 * max_ms) / 1000;
-
-    ESP_LOGI(TAG, "Opus mic streaming started (20ms frames, 16kbps)");
-
-    while (total_pcm_read < max_bytes) {
-        // Check button after minimum recording time
-        if (total_pcm_read >= min_bytes && !keep_going()) break;
-
-        // Read one 20ms frame from I2S
-        size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_chan, pcm_frame, frame_bytes,
-                                          &bytes_read, pdMS_TO_TICKS(1000));
-        if (err != ESP_OK || bytes_read < (size_t)frame_bytes) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
-        }
-        total_pcm_read += bytes_read;
-
-        // Remove DC offset from frame
-        int32_t sum = 0;
-        for (int i = 0; i < frame_samples; i++) sum += pcm_frame[i];
-        int16_t dc = (int16_t)(sum / frame_samples);
-        for (int i = 0; i < frame_samples; i++) pcm_frame[i] -= dc;
-
-        // Opus encode
-        int opus_len = opus_encode(enc, pcm_frame, frame_samples, opus_out, 256);
-        if (opus_len < 0) {
-            ESP_LOGW(TAG, "Opus encode error: %d", opus_len);
-            continue;
-        }
-
-        // Send as BLE notification: [uint16_le len][opus data]
-        uint8_t notify_buf[260];
-        notify_buf[0] = opus_len & 0xFF;
-        notify_buf[1] = (opus_len >> 8) & 0xFF;
-        memcpy(notify_buf + 2, opus_out, opus_len);
-
-        int retries = 0;
-        while (retries < 20) {
-            om = ble_hs_mbuf_from_flat(notify_buf, 2 + opus_len);
-            if (!om) { vTaskDelay(pdMS_TO_TICKS(5)); retries++; continue; }
-            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == 0) break;
-            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                vTaskDelay(pdMS_TO_TICKS(5)); retries++; continue;
-            }
-            break;
-        }
-
-        frames_sent++;
-        total_opus_bytes += opus_len;
-    }
-
-    // End marker
-    vTaskDelay(pdMS_TO_TICKS(50));
-    om = ble_hs_mbuf_from_flat(NULL, 0);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    free(pcm_frame);
-    free(opus_out);
-    opus_encoder_destroy(enc);
-
-    float duration = (float)total_pcm_read / (MIC_SAMPLE_RATE * 2);
-    ESP_LOGI(TAG, "Opus stream done: %zu frames, %zu bytes Opus (%.1fs audio, %.1f:1)",
-             frames_sent, total_opus_bytes, duration,
-             total_pcm_read > 0 ? (float)total_pcm_read / total_opus_bytes : 0);
-    return ESP_OK;
-}
-
-esp_err_t ble_test_throughput(size_t total_bytes)
-{
-    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
-
-    // Send 4-byte size header
-    uint8_t hdr[4] = {
-        (total_bytes >>  0) & 0xFF, (total_bytes >>  8) & 0xFF,
-        (total_bytes >> 16) & 0xFF, (total_bytes >> 24) & 0xFF,
-    };
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 4);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    uint8_t buf[BLE_CHUNK_SIZE];
-    size_t sent = 0;
-    // Fill with pattern
-    for (size_t i = 0; i < BLE_CHUNK_SIZE; i++) buf[i] = (uint8_t)(i & 0xFF);
-
-    while (sent < total_bytes) {
-        size_t chunk = total_bytes - sent;
-        if (chunk > BLE_CHUNK_SIZE) chunk = BLE_CHUNK_SIZE;
-
-        int retries = 0;
-        while (retries < 20) {
-            om = ble_hs_mbuf_from_flat(buf, chunk);
-            if (!om) { vTaskDelay(pdMS_TO_TICKS(1)); retries++; continue; }
-            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == 0) break;
-            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
-                vTaskDelay(pdMS_TO_TICKS(1)); retries++; continue;
-            }
-            break;
-        }
-        sent += chunk;
-    }
-
-    // End marker
-    vTaskDelay(pdMS_TO_TICKS(50));
-    om = ble_hs_mbuf_from_flat(NULL, 0);
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-
-    ESP_LOGI(TAG, "Throughput test: sent %zu bytes", sent);
-    return ESP_OK;
 }
 
 esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload_len)
@@ -665,5 +315,140 @@ esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, 1 + payload_len);
     if (om) ble_gatts_notify_custom(s_conn_handle, s_ctrl_chr_handle, om);
+    return ESP_OK;
+}
+
+esp_err_t ble_send_jpeg(const uint8_t *jpeg, size_t len)
+{
+    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
+
+    // 8-byte header: JPEG marker (0xFFFFFFFE) + uint32_le length
+    uint8_t hdr[8] = { 0xFE, 0xFF, 0xFF, 0xFF };
+    hdr[4] = (len >>  0) & 0xFF;
+    hdr[5] = (len >>  8) & 0xFF;
+    hdr[6] = (len >> 16) & 0xFF;
+    hdr[7] = (len >> 24) & 0xFF;
+
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(hdr, 8);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    // Send JPEG data in chunks with congestion retry
+    size_t sent = 0;
+    while (sent < len) {
+        size_t chunk = (len - sent > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : (len - sent);
+        om = ble_hs_mbuf_from_flat(jpeg + sent, chunk);
+        if (om) {
+            int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+            if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                os_mbuf_free_chain(om);
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+        }
+        sent += chunk;
+        if (sent % (BLE_CHUNK_SIZE * 4) == 0) vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI(TAG, "Sent %zu bytes JPEG over BLE", sent);
+    return ESP_OK;
+}
+
+esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms)
+{
+    if (!ble_is_connected() || !s_mic_notify_enabled) return ESP_ERR_INVALID_STATE;
+    if (!s_rx_chan) return ESP_ERR_INVALID_STATE;
+
+    // Create Opus encoder (16kHz mono VOIP)
+    int opus_err;
+    OpusEncoder *enc = opus_encoder_create(MIC_SAMPLE_RATE, 1,
+                                            OPUS_APPLICATION_VOIP, &opus_err);
+    if (!enc || opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "Opus encoder create failed: %d", opus_err);
+        return ESP_FAIL;
+    }
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(24000));
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(3));
+
+    // Send Opus start marker
+    uint8_t marker[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(marker, 4);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    // 20ms frame at 16kHz = 320 samples = 640 bytes PCM
+    const int frame_samples = MIC_SAMPLE_RATE / 50;
+    const int frame_bytes = frame_samples * 2;
+    int16_t pcm_buf[frame_samples];
+    uint8_t opus_out[256];
+    uint8_t send_buf[BLE_CHUNK_SIZE];
+    size_t send_pos = 0;
+
+    size_t total_frames = 0;
+    size_t total_bytes = 0;
+    uint32_t max_ticks = pdMS_TO_TICKS(max_ms);
+    uint32_t start_tick = xTaskGetTickCount();
+
+    // Minimum 500ms recording (25 frames)
+    const size_t min_frames = 25;
+
+    while ((xTaskGetTickCount() - start_tick) < max_ticks) {
+        if (total_frames >= min_frames && !keep_going()) break;
+
+        // Read 20ms of PCM from mic
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_rx_chan, pcm_buf, frame_bytes,
+                                          &bytes_read, pdMS_TO_TICKS(100));
+        if (err != ESP_OK || bytes_read < (size_t)frame_bytes) continue;
+
+        // Opus encode
+        int opus_len = opus_encode(enc, pcm_buf, frame_samples,
+                                    opus_out, sizeof(opus_out));
+        if (opus_len <= 0) continue;
+
+        // Pack: uint16_le(len) + opus_data
+        size_t packet_len = 2 + opus_len;
+        if (send_pos + packet_len > BLE_CHUNK_SIZE) {
+            // Flush current buffer
+            om = ble_hs_mbuf_from_flat(send_buf, send_pos);
+            if (om) {
+                int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+                if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
+                    os_mbuf_free_chain(om);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    // Retry flush
+                    om = ble_hs_mbuf_from_flat(send_buf, send_pos);
+                    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+                }
+            }
+            total_bytes += send_pos;
+            send_pos = 0;
+        }
+
+        // Append frame to send buffer
+        send_buf[send_pos]     = opus_len & 0xFF;
+        send_buf[send_pos + 1] = (opus_len >> 8) & 0xFF;
+        memcpy(send_buf + send_pos + 2, opus_out, opus_len);
+        send_pos += packet_len;
+        total_frames++;
+    }
+
+    // Flush remaining
+    if (send_pos > 0) {
+        om = ble_hs_mbuf_from_flat(send_buf, send_pos);
+        if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+        total_bytes += send_pos;
+    }
+
+    // End marker (empty notification)
+    vTaskDelay(pdMS_TO_TICKS(50));
+    om = ble_hs_mbuf_from_flat(NULL, 0);
+    if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+
+    opus_encoder_destroy(enc);
+
+    float duration = (float)total_frames * 20.0f / 1000.0f;
+    ESP_LOGI(TAG, "Opus stream: %zu frames (%.1fs), %zu bytes sent",
+             total_frames, duration, total_bytes);
     return ESP_OK;
 }

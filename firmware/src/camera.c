@@ -31,13 +31,12 @@ esp_err_t camera_init(void)
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
-        // Diagnostic: try RGB565 at tiny resolution to test data path
-        .pixel_format = PIXFORMAT_RGB565,
+        .pixel_format = PIXFORMAT_JPEG,
         .frame_size   = FRAMESIZE_QVGA,     // 320x240
-        .jpeg_quality = 12,
-        .fb_count     = 1,
+        .jpeg_quality = 10,
+        .fb_count     = 2,
         .fb_location  = CAMERA_FB_IN_PSRAM,
-        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode    = CAMERA_GRAB_LATEST,
     };
 
     esp_err_t err = esp_camera_init(&config);
