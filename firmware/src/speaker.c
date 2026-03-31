@@ -10,14 +10,12 @@
 
 static const char *TAG = "spk";
 static i2s_chan_handle_t s_tx_chan = NULL;
-static int s_volume = 80;  // 0-100, default 80%
+static int s_volume = 20;  // 0-100, limited by USB power + camera XCLK draw
 
 esp_err_t speaker_init(void)
 {
     // Use I2S_NUM_1 — mic uses I2S_NUM_0 (PDM, different mode)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 1024;
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);
     if (err != ESP_OK) {
@@ -27,7 +25,7 @@ esp_err_t speaker_init(void)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = SPK_BCLK_PIN,
@@ -145,7 +143,7 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
 
     // Decode frames: [uint16_le frame_len][frame_len bytes] repeated, 0x0000 = end
     int16_t *pcm_frame = heap_caps_malloc(960 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    int16_t *out_buf = heap_caps_malloc(960 * 3 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *out_buf = heap_caps_malloc(960 * 6 * sizeof(int16_t), MALLOC_CAP_SPIRAM); // stereo: 2x samples
     if (!pcm_frame || !out_buf) {
         ESP_LOGE(TAG, "Failed to alloc Opus decode buffers");
         if (pcm_frame) free(pcm_frame);
@@ -156,7 +154,12 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
     }
     size_t offset = 0;
     size_t frame_idx = 0;
-    int16_t prev_sample = 0;
+
+    // DC-blocking filter state: y[n] = x[n] - x[n-1] + 0.995 * y[n-1]
+    int32_t dc_prev_in = 0;
+    int32_t dc_prev_out = 0;
+    // Simple low-pass filter state: y[n] = 0.85*x[n] + 0.15*y[n-1]
+    int32_t lp_prev = 0;
 
     while (offset + 2 <= len) {
         uint16_t frame_len = opus_data[offset] | (opus_data[offset + 1] << 8);
@@ -181,47 +184,28 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
             continue;
         }
 
-        // Upsample + volume scale
+        // DC-block + low-pass + volume scale + stereo output
         size_t n_out = 0;
         for (int i = 0; i < n_samples; i++) {
-            int16_t cur = pcm_frame[i];
-            int16_t prev = (i == 0) ? prev_sample : pcm_frame[i - 1];
+            int32_t x = (int32_t)pcm_frame[i];
 
-            if (upsample_ratio == 3) {
-                int32_t s0 = ((int32_t)prev * 2 + (int32_t)cur) / 3;
-                int32_t s1 = ((int32_t)prev + (int32_t)cur * 2) / 3;
-                int32_t s2 = cur;
-                s0 = (s0 * scale_fixed) >> 8;
-                s1 = (s1 * scale_fixed) >> 8;
-                s2 = (s2 * scale_fixed) >> 8;
-                if (s0 > 32767) s0 = 32767;
-                if (s0 < -32768) s0 = -32768;
-                if (s1 > 32767) s1 = 32767;
-                if (s1 < -32768) s1 = -32768;
-                if (s2 > 32767) s2 = 32767;
-                if (s2 < -32768) s2 = -32768;
-                out_buf[n_out++] = (int16_t)s0;
-                out_buf[n_out++] = (int16_t)s1;
-                out_buf[n_out++] = (int16_t)s2;
-            } else if (upsample_ratio == 2) {
-                int32_t s0 = ((int32_t)prev + (int32_t)cur) / 2;
-                int32_t s1 = cur;
-                s0 = (s0 * scale_fixed) >> 8;
-                s1 = (s1 * scale_fixed) >> 8;
-                if (s0 > 32767) s0 = 32767;
-                if (s0 < -32768) s0 = -32768;
-                if (s1 > 32767) s1 = 32767;
-                if (s1 < -32768) s1 = -32768;
-                out_buf[n_out++] = (int16_t)s0;
-                out_buf[n_out++] = (int16_t)s1;
-            } else {
-                int32_t s = ((int32_t)cur * scale_fixed) >> 8;
-                if (s > 32767) s = 32767;
-                if (s < -32768) s = -32768;
-                out_buf[n_out++] = (int16_t)s;
-            }
+            // DC-blocking: y = x - x_prev + 0.995 * y_prev (fixed-point: 0.995 ≈ 255/256)
+            int32_t dc_out = x - dc_prev_in + ((dc_prev_out * 255) >> 8);
+            dc_prev_in = x;
+            dc_prev_out = dc_out;
+
+            // Light low-pass: y = 0.85*x + 0.15*prev (fixed-point: 217/256 + 39/256)
+            int32_t lp_out = (dc_out * 217 + lp_prev * 39) >> 8;
+            lp_prev = lp_out;
+
+            // Volume scale
+            int32_t s = (lp_out * scale_fixed) >> 8;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            int16_t sample = (int16_t)s;
+            out_buf[n_out++] = sample;  // L
+            out_buf[n_out++] = sample;  // R
         }
-        prev_sample = pcm_frame[n_samples - 1];
 
         size_t bw = 0;
         esp_err_t write_err = i2s_channel_write(s_tx_chan, out_buf, n_out * 2, &bw, portMAX_DELAY);

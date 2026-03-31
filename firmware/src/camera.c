@@ -32,8 +32,8 @@ esp_err_t camera_init(void)
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_QVGA,     // 320x240
-        .jpeg_quality = 10,
+        .frame_size   = FRAMESIZE_VGA,      // 640x480
+        .jpeg_quality = 6,
         .fb_count     = 2,
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
@@ -54,7 +54,8 @@ esp_err_t camera_init(void)
             ESP_LOGI(TAG, "Applying OV3660 JPEG fixes...");
             s->set_vflip(s, 1);
             s->set_brightness(s, 1);
-            s->set_saturation(s, -2);
+            s->set_saturation(s, -1);
+            s->set_sharpness(s, 2);
         }
     }
 
@@ -70,7 +71,7 @@ esp_err_t camera_init(void)
         }
     }
 
-    ESP_LOGI(TAG, "camera ready (VGA JPEG, OV%04x)", s ? s->id.PID : 0);
+    ESP_LOGI(TAG, "camera ready (VGA JPEG Q6, OV%04x)", s ? s->id.PID : 0);
     return ESP_OK;
 }
 

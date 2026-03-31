@@ -39,7 +39,6 @@ void      camera_deinit(void);
 // --- Mic API ---
 typedef bool (*mic_keep_recording_fn)(void);
 esp_err_t mic_init(void);
-esp_err_t mic_record(int duration_ms, uint8_t **out_buf, size_t *out_len);
 void      mic_free_buf(uint8_t *buf);
 
 // --- SD Card (onboard Sense board slot, SPI mode) ---

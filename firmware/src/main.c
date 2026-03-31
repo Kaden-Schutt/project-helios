@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 
 #include "helios.h"
+#include "esp_cache.h"
 
 static const char *TAG = "helios";
 
@@ -66,6 +67,9 @@ static void speaker_task(void *arg)
 {
     spk_args_t *a = (spk_args_t *)arg;
     ESP_LOGI(TAG, "Speaker task: playing %zu bytes Opus on Core 1", a->len);
+    // Invalidate Core 1's cache so we read fresh data written by Core 0
+    size_t inv_size = (a->len + 31) & ~31;
+    esp_cache_msync(a->data, inv_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     speaker_play_opus(a->data, a->len, a->sample_rate);
     ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
     ESP_LOGI(TAG, "Playback done");
@@ -89,6 +93,13 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
     if (is_last) {
         if (!tts_done) {
             tts_done = true;
+            // Flush CPU cache to PSRAM so Core 1 sees the data
+            // Align to cache line size (32 bytes) as required by esp_cache_msync
+            if (tts_buf && tts_received > 0) {
+                size_t flush_size = (tts_received + 31) & ~31;
+                if (flush_size > TTS_BUF_SIZE) flush_size = TTS_BUF_SIZE;
+                esp_cache_msync(tts_buf, flush_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            }
             xSemaphoreGive(tts_sem);
         }
         return;
@@ -100,6 +111,9 @@ static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is
     }
 
     if (!tts_done && tts_received >= tts_expected && tts_expected > 0) {
+        size_t flush_size = (tts_received + 31) & ~31;
+        if (flush_size > TTS_BUF_SIZE) flush_size = TTS_BUF_SIZE;
+        esp_cache_msync(tts_buf, flush_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
         tts_done = true;
         xSemaphoreGive(tts_sem);
     }
@@ -160,7 +174,7 @@ void app_main(void)
     tts_sem = xSemaphoreCreateBinary();
     spk_done_sem = xSemaphoreCreateBinary();
     xSemaphoreGive(spk_done_sem);  // start as "available" (no speaker running)
-    tts_buf = heap_caps_malloc(TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    tts_buf = heap_caps_aligned_alloc(32, TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG, "Initializing BLE...");
     esp_err_t ble_ok = ble_init(on_tts_chunk, on_control);
@@ -172,47 +186,28 @@ void app_main(void)
     printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
     printf("  TTS buf: %s\n", tts_buf ? "OK (256KB PSRAM)" : "FAILED");
     printf("  Volume:  %d%%\n", cfg.speaker_volume);
-    printf("  Heap:    %lu KB free\n\n", (unsigned long)(esp_get_free_heap_size() / 1024));
+    printf("  Heap:    %lu KB free\n", (unsigned long)(esp_get_free_heap_size() / 1024));
 
-    // Quick mic test
-    if (mic_ok == ESP_OK) {
-        uint8_t *test_pcm = NULL;
-        size_t test_len = 0;
-        if (mic_record(500, &test_pcm, &test_len) == ESP_OK) {
-            int16_t *samples = (int16_t *)test_pcm;
-            int32_t peak = 0;
-            for (size_t i = 0; i < test_len / 2; i++) {
-                int32_t v = samples[i] < 0 ? -samples[i] : samples[i];
-                if (v > peak) peak = v;
-            }
-            printf("  Mic test: peak=%ld %s\n", (long)peak, peak > 100 ? "OK" : "WARN");
-            mic_free_buf(test_pcm);
-        }
-    }
-
-    // Auto-detect button idle level (or use saved)
+    // Button idle level: use saved or sample now (no delay)
     if (cfg.button_idle_level >= 0) {
         button_idle_level = cfg.button_idle_level;
-        ESP_LOGI(TAG, "Button idle level from config: %d", button_idle_level);
     } else {
-        ESP_LOGI(TAG, "Auto-detecting button...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
         int high = 0;
         for (int i = 0; i < 10; i++) {
             high += gpio_get_level(BUTTON_GPIO);
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
         button_idle_level = (high >= 5) ? 1 : 0;
         cfg.button_idle_level = button_idle_level;
         if (sd_ok == ESP_OK) config_save(&cfg);
     }
 
-    printf("\n  Waiting for BLE connection...\n");
+    printf("  Waiting for BLE...\n");
     while (!ble_is_connected()) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    printf("  Connected! Hold button to talk.\n\n");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("  Ready.\n\n");
 
     // --- Main voice loop ---
     while (1) {
@@ -264,7 +259,10 @@ void app_main(void)
 
             // 3. Stream mic Opus until button released
             ESP_LOGI(TAG, "LISTENING...");
-            ble_stream_mic_opus(button_pressed, 30000);
+            esp_err_t mic_rc = ble_stream_mic_opus(button_pressed, 30000);
+            if (mic_rc != ESP_OK) {
+                ESP_LOGE(TAG, "Mic stream failed: 0x%x", mic_rc);
+            }
 
             // 4. Notify Pi: button released
             ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
@@ -280,8 +278,8 @@ void app_main(void)
                     args->data = tts_buf;
                     args->len = tts_received;
                     args->sample_rate = SPK_SAMPLE_RATE;
-                    xTaskCreatePinnedToCore(speaker_task, "spk", 8192,
-                                            args, 5, NULL, 1);
+                    xTaskCreatePinnedToCore(speaker_task, "spk", 32768,
+                                            args, 5, NULL, 0);
                 } else {
                     xSemaphoreGive(spk_done_sem);  // no task spawned
                 }

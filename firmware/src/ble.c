@@ -333,23 +333,30 @@ esp_err_t ble_send_jpeg(const uint8_t *jpeg, size_t len)
     if (om) ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
     vTaskDelay(pdMS_TO_TICKS(5));
 
-    // Send JPEG data in chunks with congestion retry
+    // Send JPEG data in chunks — pace every chunk to prevent BLE drops
     size_t sent = 0;
     while (sent < len) {
         size_t chunk = (len - sent > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : (len - sent);
-        om = ble_hs_mbuf_from_flat(jpeg + sent, chunk);
-        if (om) {
+        int retries = 0;
+        while (retries < 20) {
+            om = ble_hs_mbuf_from_flat(jpeg + sent, chunk);
+            if (!om) { vTaskDelay(pdMS_TO_TICKS(10)); retries++; continue; }
             int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
+            if (rc == 0) break;
             if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
                 os_mbuf_free_chain(om);
                 vTaskDelay(pdMS_TO_TICKS(20));
+                retries++;
                 continue;
             }
+            break;
         }
         sent += chunk;
-        if (sent % (BLE_CHUNK_SIZE * 4) == 0) vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(10));  // pace every chunk
     }
 
+    // Gap before Opus marker to prevent it being dropped
+    vTaskDelay(pdMS_TO_TICKS(30));
     ESP_LOGI(TAG, "Sent %zu bytes JPEG over BLE", sent);
     return ESP_OK;
 }

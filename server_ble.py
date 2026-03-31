@@ -68,7 +68,10 @@ CMD_PLAYBACK_DONE   = 0x12
 
 CONVERSATION_TIMEOUT = 300
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+logging.getLogger("bleak").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.INFO)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("helios")
 
 # --- Conversation ---
@@ -301,6 +304,8 @@ class HeliosClient:
 
     def _on_mic_notify(self, sender, data: bytearray):
         """Demux multiplexed stream: JPEG (0xFFFFFFFE) then Opus (0xFFFFFFFF)."""
+        hdr = data[:4].hex() if len(data) >= 4 else data.hex()
+        log.debug(f"[MIC-RAW] {len(data)} bytes, hdr={hdr}, jpeg_recv={self.jpeg_receiving}, mic_recv={self.mic_receiving}, opus={self.mic_opus_mode}")
 
         # Empty = end of stream
         if len(data) == 0:
@@ -316,13 +321,24 @@ class HeliosClient:
         if self.jpeg_receiving:
             self.jpeg_buffer.extend(data)
             if len(self.jpeg_buffer) >= self.jpeg_expected:
-                # JPEG complete
+                # JPEG complete — auto-enter Opus mode (marker may be dropped)
                 jpeg_data = bytes(self.jpeg_buffer[:self.jpeg_expected])
                 self.jpeg_b64 = base64.b64encode(jpeg_data).decode()
                 valid = jpeg_data[:2] == b'\xff\xd8'
                 log.info(f"[JPEG] Complete: {len(jpeg_data):,} bytes (valid={valid})")
                 self.jpeg_receiving = False
                 self.jpeg_buffer = None
+                # Pre-enter Opus mode so we don't need the marker
+                self.mic_opus_mode = True
+                self.mic_buffer = bytearray()
+                self.mic_receiving = True
+                self.mic_opus_frames = 0
+                try:
+                    import opuslib
+                    self.opus_dec = opuslib.Decoder(STT_SAMPLE_RATE, 1)
+                except Exception as e:
+                    log.error(f"[MIC] Opus decoder failed: {e}")
+                    self.opus_dec = None
             return
 
         # --- Detect markers (when not in JPEG or Opus mode) ---
@@ -353,6 +369,9 @@ class HeliosClient:
 
         # --- Opus data ---
         if self.mic_opus_mode and self.opus_dec:
+            # Skip redundant Opus start marker if it wasn't dropped
+            if len(data) == 4 and data[:4] == b'\xFF\xFF\xFF\xFF':
+                return
             offset = 0
             while offset + 2 <= len(data):
                 frame_len = data[offset] | (data[offset + 1] << 8)
@@ -379,6 +398,12 @@ class HeliosClient:
             asyncio.get_running_loop().create_task(self._open_stt_stream())
         elif cmd == CMD_BUTTON_RELEASED:
             log.info("[ESP32] Button released")
+            # Fallback: if mic stream never sent end marker, trigger query now
+            if not self.query_event.is_set():
+                log.warning("[ESP32] No mic end marker received — triggering query from BUTTON_RELEASED")
+                self.mic_receiving = False
+                self.mic_opus_mode = False
+                self.query_event.set()
         elif cmd == CMD_PLAYBACK_DONE:
             log.info("[ESP32] Playback finished")
 
@@ -426,23 +451,21 @@ class HeliosClient:
 
         # 4-byte size header
         header = struct.pack('<I', total_len)
-        await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=False)
-        await asyncio.sleep(0.01)
+        await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=True)
 
-        # Data chunks
+        # Data chunks — response=True guarantees delivery (no silent drops)
         offset = 0
         chunks = 0
         while offset < total_len:
             end = min(offset + BLE_CHUNK_SIZE, total_len)
             chunk = opus_data[offset:end]
-            await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=False)
+            await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=True)
             offset = end
             chunks += 1
-            await asyncio.sleep(0.005)
 
         # Empty end marker
-        await asyncio.sleep(0.05)
-        await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=False)
+        await asyncio.sleep(0.02)
+        await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
         log.info(f"[TX] Sent {total_len:,} bytes Opus in {chunks} BLE chunks")
 
     async def run(self):
@@ -496,8 +519,14 @@ class HeliosClient:
                 log.error("[TTS] No audio returned")
                 continue
 
+            # Check TTS PCM amplitude before encoding
+            import numpy as np
+            pcm_arr = np.frombuffer(tts_pcm, dtype=np.int16)
+            log.info(f"[PCM-DBG] TTS PCM: peak={np.max(np.abs(pcm_arr))}, rms={int(np.sqrt(np.mean(pcm_arr.astype(np.float64)**2)))}")
+
             # Opus encode + send
             opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
+            log.info(f"[OPUS-DBG] first 16 bytes: {opus_data[:16].hex()}")
             await self.send_tts(opus_data)
 
             total = time.time() - t0
