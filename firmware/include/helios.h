@@ -39,6 +39,7 @@ void      camera_deinit(void);
 // --- Mic API ---
 typedef bool (*mic_keep_recording_fn)(void);
 esp_err_t mic_init(void);
+void      mic_deinit(void);
 void      mic_free_buf(uint8_t *buf);
 
 // --- SD Card (onboard Sense board slot, SPI mode) ---
@@ -65,10 +66,14 @@ bool      sdcard_is_mounted(void);
 
 // --- Speaker API ---
 esp_err_t speaker_init(void);
+void      speaker_deinit(void);
 void      speaker_set_volume(int percent);  // 0-100
 int       speaker_get_volume(void);
 esp_err_t speaker_play(const uint8_t *pcm_s16, size_t len);
 esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample_rate);
+esp_err_t speaker_play_opus_stream(const uint8_t *buf, size_t buf_size,
+                                    volatile size_t *received, volatile bool *done,
+                                    int src_sample_rate);
 esp_err_t speaker_stop(void);
 
 // --- BLE (NimBLE GATT Server) ---

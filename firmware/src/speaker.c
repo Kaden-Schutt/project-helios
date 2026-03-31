@@ -5,12 +5,22 @@
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "opus.h"
+#include "esp_cache.h"
 #include <string.h>
 #include <stdlib.h>
 
+// 200Hz 2nd-order Butterworth high-pass biquad (Q14 fixed-point)
+// fc=200Hz, fs=24000Hz, Q=0.7071. Blocks DC + sub-bass rumble.
+#define HP_B0   15788
+#define HP_B1  -31577
+#define HP_B2   15788
+#define HP_A1  -31555
+#define HP_A2   15215
+#define HP_SHIFT 14
+
 static const char *TAG = "spk";
 static i2s_chan_handle_t s_tx_chan = NULL;
-static int s_volume = 20;  // 0-100, limited by USB power + camera XCLK draw
+static int s_volume = 50;  // 0-100, camera+mic killed during playback so no rail noise
 
 esp_err_t speaker_init(void)
 {
@@ -49,6 +59,15 @@ esp_err_t speaker_init(void)
     ESP_LOGI(TAG, "speaker ready (LRC=%d, BCLK=%d, DIN=%d, %d Hz, vol=%d%%)",
              SPK_LRC_PIN, SPK_BCLK_PIN, SPK_DIN_PIN, SPK_SAMPLE_RATE, s_volume);
     return ESP_OK;
+}
+
+void speaker_deinit(void)
+{
+    if (!s_tx_chan) return;
+    i2s_channel_disable(s_tx_chan);
+    i2s_del_channel(s_tx_chan);
+    s_tx_chan = NULL;
+    ESP_LOGI(TAG, "speaker deinitialized");
 }
 
 void speaker_set_volume(int percent)
@@ -123,7 +142,6 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
     if (!s_tx_chan) return ESP_ERR_INVALID_STATE;
     if (!opus_data || len == 0) return ESP_ERR_INVALID_ARG;
 
-    int upsample_ratio = SPK_SAMPLE_RATE / src_sample_rate;
     float scale = (s_volume / 100.0f) * SPK_MAX_SCALE;
     int scale_fixed = (int)(scale * 256.0f);
 
@@ -155,9 +173,8 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
     size_t offset = 0;
     size_t frame_idx = 0;
 
-    // DC-blocking filter state: y[n] = x[n] - x[n-1] + 0.995 * y[n-1]
-    int32_t dc_prev_in = 0;
-    int32_t dc_prev_out = 0;
+    // 200Hz high-pass biquad state (Direct Form II Transposed)
+    int32_t hp_w1 = 0, hp_w2 = 0;
     // Simple low-pass filter state: y[n] = 0.85*x[n] + 0.15*y[n-1]
     int32_t lp_prev = 0;
 
@@ -184,18 +201,18 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
             continue;
         }
 
-        // DC-block + low-pass + volume scale + stereo output
+        // Biquad HP + low-pass + volume scale + stereo output
         size_t n_out = 0;
         for (int i = 0; i < n_samples; i++) {
             int32_t x = (int32_t)pcm_frame[i];
 
-            // DC-blocking: y = x - x_prev + 0.995 * y_prev (fixed-point: 0.995 ≈ 255/256)
-            int32_t dc_out = x - dc_prev_in + ((dc_prev_out * 255) >> 8);
-            dc_prev_in = x;
-            dc_prev_out = dc_out;
+            // 200Hz high-pass biquad (Direct Form II Transposed, Q14)
+            int32_t hp_out = ((int32_t)HP_B0 * x + hp_w1) >> HP_SHIFT;
+            hp_w1 = (int32_t)HP_B1 * x - (int32_t)HP_A1 * hp_out + hp_w2;
+            hp_w2 = (int32_t)HP_B2 * x - (int32_t)HP_A2 * hp_out;
 
             // Light low-pass: y = 0.85*x + 0.15*prev (fixed-point: 217/256 + 39/256)
-            int32_t lp_out = (dc_out * 217 + lp_prev * 39) >> 8;
+            int32_t lp_out = (hp_out * 217 + lp_prev * 39) >> 8;
             lp_prev = lp_out;
 
             // Volume scale
@@ -236,6 +253,144 @@ esp_err_t speaker_play_opus(const uint8_t *opus_data, size_t len, int src_sample
 
     i2s_channel_disable(s_tx_chan);
     ESP_LOGI(TAG, "Opus playback done");
+    return ESP_OK;
+}
+
+esp_err_t speaker_play_opus_stream(const uint8_t *buf, size_t buf_size,
+                                    volatile size_t *received, volatile bool *done,
+                                    int src_sample_rate)
+{
+    if (!s_tx_chan) return ESP_ERR_INVALID_STATE;
+    if (!buf || !received || !done) return ESP_ERR_INVALID_ARG;
+
+    float scale = (s_volume / 100.0f) * SPK_MAX_SCALE;
+    int scale_fixed = (int)(scale * 256.0f);
+
+    // Create Opus decoder
+    int opus_err;
+    OpusDecoder *dec = opus_decoder_create(src_sample_rate, 1, &opus_err);
+    if (!dec || opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "Opus decoder create failed: %d", opus_err);
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = i2s_channel_enable(s_tx_chan);
+    if (err != ESP_OK) {
+        opus_decoder_destroy(dec);
+        return err;
+    }
+
+    int16_t *pcm_frame = heap_caps_malloc(960 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *out_buf = heap_caps_malloc(960 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!pcm_frame || !out_buf) {
+        ESP_LOGE(TAG, "Failed to alloc decode buffers");
+        if (pcm_frame) free(pcm_frame);
+        if (out_buf) free(out_buf);
+        opus_decoder_destroy(dec);
+        i2s_channel_disable(s_tx_chan);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Filter state
+    int32_t hp_w1 = 0, hp_w2 = 0;
+    int32_t lp_prev = 0;
+
+    size_t read_offset = 0;
+    size_t frame_idx = 0;
+
+    while (1) {
+        // Wait for frame header (2 bytes)
+        while (read_offset + 2 > *received) {
+            if (*done) goto stream_done;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        // Invalidate cache before reading header
+        size_t inv_start = read_offset & ~31;
+        size_t inv_end = (*received + 31) & ~31;
+        if (inv_end > buf_size) inv_end = buf_size;
+        if (inv_end > inv_start) {
+            esp_cache_msync((void *)(buf + inv_start), inv_end - inv_start,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        }
+
+        uint16_t frame_len = buf[read_offset] | (buf[read_offset + 1] << 8);
+        read_offset += 2;
+
+        if (frame_len == 0) {
+            ESP_LOGI(TAG, "Opus end marker after %zu frames", frame_idx);
+            break;
+        }
+
+        // Wait for frame data
+        while (read_offset + frame_len > *received) {
+            if (*done) {
+                ESP_LOGW(TAG, "Truncated frame %zu: need %u, have %zu",
+                         frame_idx, frame_len, *received - read_offset);
+                goto stream_done;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        // Invalidate cache for frame data
+        inv_start = read_offset & ~31;
+        inv_end = (read_offset + frame_len + 31) & ~31;
+        if (inv_end > buf_size) inv_end = buf_size;
+        if (inv_end > inv_start) {
+            esp_cache_msync((void *)(buf + inv_start), inv_end - inv_start,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        }
+
+        int n_samples = opus_decode(dec, buf + read_offset, frame_len,
+                                     pcm_frame, 960, 0);
+        read_offset += frame_len;
+
+        if (n_samples <= 0) {
+            ESP_LOGE(TAG, "Opus decode failed: frame=%zu err=%d", frame_idx, n_samples);
+            frame_idx++;
+            continue;
+        }
+
+        // Biquad HP + low-pass + volume scale + stereo output
+        size_t n_out = 0;
+        for (int i = 0; i < n_samples; i++) {
+            int32_t x = (int32_t)pcm_frame[i];
+
+            int32_t hp_out = ((int32_t)HP_B0 * x + hp_w1) >> HP_SHIFT;
+            hp_w1 = (int32_t)HP_B1 * x - (int32_t)HP_A1 * hp_out + hp_w2;
+            hp_w2 = (int32_t)HP_B2 * x - (int32_t)HP_A2 * hp_out;
+
+            int32_t lp_out = (hp_out * 217 + lp_prev * 39) >> 8;
+            lp_prev = lp_out;
+
+            int32_t s = (lp_out * scale_fixed) >> 8;
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            int16_t sample = (int16_t)s;
+            out_buf[n_out++] = sample;  // L
+            out_buf[n_out++] = sample;  // R
+        }
+
+        size_t bw = 0;
+        i2s_channel_write(s_tx_chan, out_buf, n_out * 2, &bw, portMAX_DELAY);
+        frame_idx++;
+    }
+
+stream_done:
+    free(pcm_frame);
+    free(out_buf);
+    opus_decoder_destroy(dec);
+
+    // Silence flush
+    int16_t silence[512] = {0};
+    size_t bw2 = 0;
+    for (int i = 0; i < 4; i++) {
+        i2s_channel_write(s_tx_chan, silence, sizeof(silence), &bw2, portMAX_DELAY);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    i2s_channel_disable(s_tx_chan);
+    ESP_LOGI(TAG, "Opus stream done: %zu frames, %zu bytes consumed", frame_idx, read_offset);
     return ESP_OK;
 }
 

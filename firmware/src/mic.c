@@ -56,3 +56,12 @@ void mic_free_buf(uint8_t *buf)
 {
     free(buf);
 }
+
+void mic_deinit(void)
+{
+    if (!s_rx_chan) return;
+    i2s_channel_disable(s_rx_chan);
+    i2s_del_channel(s_rx_chan);
+    s_rx_chan = NULL;
+    ESP_LOGI(TAG, "mic deinitialized");
+}

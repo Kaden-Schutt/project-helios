@@ -211,6 +211,162 @@ async def tts_synthesize(text: str) -> bytes:
     return resp.content
 
 
+# --- TTS Streaming (Cartesia WebSocket → Opus → BLE) ---
+TTS_STREAM_WATERMARK = 900  # ~300ms of Opus at 24kbps before starting BLE send
+
+async def tts_stream_and_send(text: str, helios: "HeliosClient"):
+    """Stream TTS: Cartesia WebSocket → Opus encode → 300ms buffer → BLE stream."""
+    import uuid
+    try:
+        import opuslib
+    except ImportError:
+        log.error("opuslib not installed! Falling back to batch TTS")
+        tts_pcm = await tts_synthesize(text)
+        if tts_pcm:
+            opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
+            await helios.send_tts(opus_data)
+        return
+
+    log.info(f"[TTS-STREAM] Synthesizing {len(text)} chars via WebSocket")
+    t0 = time.time()
+
+    uri = (f"wss://api.cartesia.ai/tts/websocket"
+           f"?api_key={CARTESIA_API_KEY}"
+           f"&cartesia_version={CARTESIA_VERSION}")
+
+    context_id = str(uuid.uuid4())
+    request_msg = json.dumps({
+        "model_id": TTS_MODEL,
+        "transcript": text,
+        "voice": {"mode": "id", "id": TTS_VOICE_ID},
+        "output_format": {
+            "container": "raw",
+            "encoding": "pcm_s16le",
+            "sample_rate": TTS_SAMPLE_RATE,
+        },
+        "context_id": context_id,
+        "language": "en",
+    })
+
+    enc = opuslib.Encoder(TTS_SAMPLE_RATE, 1, opuslib.APPLICATION_VOIP)
+    frame_samples = TTS_SAMPLE_RATE // 50  # 20ms = 480 samples at 24kHz
+    frame_bytes = frame_samples * 2        # 960 bytes per frame
+
+    pcm_accum = bytearray()
+    opus_buf = bytearray()
+    streaming = False
+    total_pcm = 0
+    total_opus_sent = 0
+
+    try:
+        async with websockets.connect(uri) as ws:
+            await ws.send(request_msg)
+            log.info(f"[TTS-STREAM] Request sent (context={context_id[:8]})")
+
+            async for msg in ws:
+                if not isinstance(msg, str):
+                    continue
+
+                data = json.loads(msg)
+                msg_type = data.get("type", "")
+
+                if msg_type == "chunk":
+                    # Decode base64 PCM chunk
+                    pcm_chunk = base64.b64decode(data.get("data", ""))
+                    pcm_accum.extend(pcm_chunk)
+                    total_pcm += len(pcm_chunk)
+
+                    # Encode complete 20ms frames to Opus
+                    while len(pcm_accum) >= frame_bytes:
+                        pcm_frame = bytes(pcm_accum[:frame_bytes])
+                        del pcm_accum[:frame_bytes]
+                        opus_frame = enc.encode(pcm_frame, frame_samples)
+                        opus_buf.extend(struct.pack('<H', len(opus_frame)))
+                        opus_buf.extend(opus_frame)
+
+                    # Watermark: start streaming over BLE
+                    if not streaming and len(opus_buf) >= TTS_STREAM_WATERMARK:
+                        streaming = True
+                        log.info(f"[TTS-STREAM] Watermark reached ({len(opus_buf)} bytes), "
+                                 f"starting BLE stream")
+                        # Send start marker
+                        await helios.client.write_gatt_char(
+                            SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
+                        # Send buffered data
+                        offset = 0
+                        while offset < len(opus_buf):
+                            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                            await helios.client.write_gatt_char(
+                                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                            offset = end
+                        total_opus_sent += len(opus_buf)
+                        opus_buf.clear()
+
+                    # In streaming mode, send new opus data as it arrives
+                    elif streaming and len(opus_buf) > 0:
+                        offset = 0
+                        while offset < len(opus_buf):
+                            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+                            await helios.client.write_gatt_char(
+                                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                            offset = end
+                        total_opus_sent += len(opus_buf)
+                        opus_buf.clear()
+
+                elif msg_type == "done":
+                    break
+
+                elif msg_type == "error":
+                    log.error(f"[TTS-STREAM] Cartesia error: {data}")
+                    break
+
+    except Exception as e:
+        log.error(f"[TTS-STREAM] WebSocket error: {e}")
+        if not streaming:
+            # Fallback to batch if streaming never started
+            log.info("[TTS-STREAM] Falling back to batch TTS")
+            tts_pcm = await tts_synthesize(text)
+            if tts_pcm:
+                opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
+                await helios.send_tts(opus_data)
+            return
+
+    # Encode any remaining PCM (pad to full frame)
+    if len(pcm_accum) > 0:
+        pcm_accum.extend(b'\x00' * (frame_bytes - len(pcm_accum)))
+        opus_frame = enc.encode(bytes(pcm_accum), frame_samples)
+        opus_buf.extend(struct.pack('<H', len(opus_frame)))
+        opus_buf.extend(opus_frame)
+
+    # Append Opus end marker
+    opus_buf.extend(struct.pack('<H', 0))
+
+    if not streaming:
+        # Never reached watermark — send everything now
+        await helios.client.write_gatt_char(
+            SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
+
+    # Send remaining data
+    if len(opus_buf) > 0:
+        offset = 0
+        while offset < len(opus_buf):
+            end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
+            await helios.client.write_gatt_char(
+                SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+            offset = end
+        total_opus_sent += len(opus_buf)
+
+    # Empty end marker
+    await asyncio.sleep(0.02)
+    await helios.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
+
+    elapsed = time.time() - t0
+    duration = total_pcm / 2 / TTS_SAMPLE_RATE
+    log.info(f"[TTS-STREAM] Done in {elapsed:.1f}s — "
+             f"{total_pcm:,} bytes PCM ({duration:.1f}s), "
+             f"{total_opus_sent:,} bytes Opus sent")
+
+
 # --- BLE Client ---
 
 class HeliosClient:
@@ -446,11 +602,11 @@ class HeliosClient:
         return True
 
     async def send_tts(self, opus_data: bytes):
-        """Send Opus TTS data to ESP: size header + data chunks + empty end."""
+        """Send Opus TTS data to ESP: start marker + data chunks + empty end."""
         total_len = len(opus_data)
 
-        # 4-byte size header
-        header = struct.pack('<I', total_len)
+        # Start marker (mirrors mic→Pi Opus protocol)
+        header = b'\xFF\xFF\xFF\xFF'
         await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=True)
 
         # Data chunks — response=True guarantees delivery (no silent drops)
@@ -513,21 +669,8 @@ class HeliosClient:
             conversation["history"].append({"role": "assistant", "content": response_text})
             conversation["last_time"] = time.time()
 
-            # TTS
-            tts_pcm = await tts_synthesize(response_text)
-            if not tts_pcm:
-                log.error("[TTS] No audio returned")
-                continue
-
-            # Check TTS PCM amplitude before encoding
-            import numpy as np
-            pcm_arr = np.frombuffer(tts_pcm, dtype=np.int16)
-            log.info(f"[PCM-DBG] TTS PCM: peak={np.max(np.abs(pcm_arr))}, rms={int(np.sqrt(np.mean(pcm_arr.astype(np.float64)**2)))}")
-
-            # Opus encode + send
-            opus_data = pcm_to_opus(tts_pcm, TTS_SAMPLE_RATE)
-            log.info(f"[OPUS-DBG] first 16 bytes: {opus_data[:16].hex()}")
-            await self.send_tts(opus_data)
+            # TTS → Opus → BLE (streaming)
+            await tts_stream_and_send(response_text, self)
 
             total = time.time() - t0
             log.info(f"[TOTAL] {total:.1f}s | \"{response_text[:60]}\"")

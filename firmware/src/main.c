@@ -27,11 +27,13 @@ static const char *TAG = "helios";
 
 // TTS receive buffer (256KB in PSRAM)
 #define TTS_BUF_SIZE    (256 * 1024)
+#define TTS_WATERMARK   900   // ~300ms of Opus at 24kbps before playback starts
 static uint8_t *tts_buf = NULL;
 static volatile size_t tts_received = 0;
-static volatile size_t tts_expected = 0;
 static volatile bool tts_done = false;
+static volatile bool tts_watermark_given = false;
 static SemaphoreHandle_t tts_sem = NULL;
+static SemaphoreHandle_t tts_watermark_sem = NULL;
 static SemaphoreHandle_t spk_done_sem = NULL;  // signalled when speaker_task finishes
 
 // Config
@@ -56,66 +58,96 @@ static bool button_pressed(void)
     return gpio_get_level(BUTTON_GPIO) != button_idle_level;
 }
 
-// --- Speaker task (runs on Core 1) ---
-typedef struct {
-    uint8_t *data;
-    size_t len;
-    int sample_rate;
-} spk_args_t;
+// --- Speaker task (runs on Core 1, owns full playback lifecycle) ---
+// Waits for watermark, inits speaker, streams Opus from PSRAM buffer,
+// deinits speaker, re-inits camera+mic, signals spk_done_sem.
 
 static void speaker_task(void *arg)
 {
-    spk_args_t *a = (spk_args_t *)arg;
-    ESP_LOGI(TAG, "Speaker task: playing %zu bytes Opus on Core 1", a->len);
-    // Invalidate Core 1's cache so we read fresh data written by Core 0
-    size_t inv_size = (a->len + 31) & ~31;
-    esp_cache_msync(a->data, inv_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-    speaker_play_opus(a->data, a->len, a->sample_rate);
+    int sample_rate = (int)(intptr_t)arg;
+
+    // Wait for enough data to start playback
+    ESP_LOGI(TAG, "Speaker task: waiting for watermark (%d bytes)...", TTS_WATERMARK);
+    if (xSemaphoreTake(tts_watermark_sem, pdMS_TO_TICKS(60000)) != pdTRUE) {
+        ESP_LOGW(TAG, "TTS watermark timeout — no audio received");
+        goto cleanup;
+    }
+
+    // Init speaker (camera+mic already deinit'd by main loop)
+    esp_err_t err = speaker_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "speaker_init failed: 0x%x", err);
+        goto cleanup;
+    }
+    speaker_set_volume(cfg.speaker_volume);
+
+    ESP_LOGI(TAG, "Streaming playback started (%zu bytes buffered)", tts_received);
+    speaker_play_opus_stream(tts_buf, TTS_BUF_SIZE,
+                              &tts_received, &tts_done, sample_rate);
     ble_notify_control(BLE_CMD_PLAYBACK_DONE, NULL, 0);
     ESP_LOGI(TAG, "Playback done");
-    free(a);
-    xSemaphoreGive(spk_done_sem);  // signal: safe to reuse tts_buf
+
+cleanup:
+    speaker_deinit();
+    ESP_LOGI(TAG, "Restoring camera + mic...");
+    camera_init();
+    mic_init();
+    xSemaphoreGive(spk_done_sem);
     vTaskDelete(NULL);
 }
 
 // --- BLE Callbacks ---
 static void on_tts_chunk(const uint8_t *data, size_t len, bool is_first, bool is_last)
 {
-    if (is_first && len >= 4) {
-        tts_expected = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+    // Start marker: 0xFFFFFFFF (mirrors mic→Pi Opus protocol)
+    if (is_first && len >= 4 &&
+        data[0] == 0xFF && data[1] == 0xFF && data[2] == 0xFF && data[3] == 0xFF) {
         tts_received = 0;
         tts_done = false;
-        ESP_LOGI(TAG, "TTS incoming: %zu bytes", tts_expected);
+        tts_watermark_given = false;
+        xSemaphoreTake(tts_watermark_sem, 0);  // drain any stale signal
+        ESP_LOGI(TAG, "TTS stream started");
         data += 4;
         len -= 4;
     }
 
+    // End marker: empty write
     if (is_last) {
         if (!tts_done) {
             tts_done = true;
-            // Flush CPU cache to PSRAM so Core 1 sees the data
-            // Align to cache line size (32 bytes) as required by esp_cache_msync
             if (tts_buf && tts_received > 0) {
                 size_t flush_size = (tts_received + 31) & ~31;
                 if (flush_size > TTS_BUF_SIZE) flush_size = TTS_BUF_SIZE;
                 esp_cache_msync(tts_buf, flush_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            }
+            // Wake speaker task if watermark was never reached (short response)
+            if (!tts_watermark_given) {
+                tts_watermark_given = true;
+                xSemaphoreGive(tts_watermark_sem);
             }
             xSemaphoreGive(tts_sem);
         }
         return;
     }
 
+    // Append data to PSRAM buffer
     if (tts_buf && len > 0 && tts_received + len <= TTS_BUF_SIZE) {
         memcpy(tts_buf + tts_received, data, len);
         tts_received += len;
-    }
 
-    if (!tts_done && tts_received >= tts_expected && tts_expected > 0) {
-        size_t flush_size = (tts_received + 31) & ~31;
-        if (flush_size > TTS_BUF_SIZE) flush_size = TTS_BUF_SIZE;
-        esp_cache_msync(tts_buf, flush_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-        tts_done = true;
-        xSemaphoreGive(tts_sem);
+        // Flush cache after every write for streaming coherence
+        size_t flush_start = (tts_received - len) & ~31;
+        size_t flush_end = (tts_received + 31) & ~31;
+        if (flush_end > TTS_BUF_SIZE) flush_end = TTS_BUF_SIZE;
+        esp_cache_msync(tts_buf + flush_start, flush_end - flush_start,
+                        ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+        // Watermark: signal speaker task to start
+        if (!tts_watermark_given && tts_received >= TTS_WATERMARK) {
+            tts_watermark_given = true;
+            xSemaphoreGive(tts_watermark_sem);
+            ESP_LOGI(TAG, "TTS watermark reached (%zu bytes)", tts_received);
+        }
     }
 }
 
@@ -147,12 +179,9 @@ void app_main(void)
     printf("  HELIOS — BLE Voice + Vision Assistant\n");
     printf("========================================\n\n");
 
-    // Init peripherals
+    // Init peripherals (speaker deferred — only init'd during playback)
     ESP_LOGI(TAG, "Initializing mic...");
     esp_err_t mic_ok = mic_init();
-
-    ESP_LOGI(TAG, "Initializing speaker...");
-    esp_err_t spk_ok = speaker_init();
 
     ESP_LOGI(TAG, "Initializing SD card...");
     esp_err_t sd_ok = sdcard_init();
@@ -166,12 +195,12 @@ void app_main(void)
     } else {
         config_defaults(&cfg);
     }
-    if (spk_ok == ESP_OK) speaker_set_volume(cfg.speaker_volume);
 
     button_init();
 
     // Init BLE
     tts_sem = xSemaphoreCreateBinary();
+    tts_watermark_sem = xSemaphoreCreateBinary();
     spk_done_sem = xSemaphoreCreateBinary();
     xSemaphoreGive(spk_done_sem);  // start as "available" (no speaker running)
     tts_buf = heap_caps_aligned_alloc(32, TTS_BUF_SIZE, MALLOC_CAP_SPIRAM);
@@ -180,7 +209,7 @@ void app_main(void)
     esp_err_t ble_ok = ble_init(on_tts_chunk, on_control);
 
     printf("  Mic:     %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
-    printf("  Speaker: %s\n", spk_ok == ESP_OK ? "OK" : "FAILED");
+    printf("  Speaker: deferred (init during playback)\n");
     printf("  SD Card: %s\n", sd_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Camera:  %s\n", cam_ok == ESP_OK ? "OK" : "FAILED");
     printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
@@ -235,17 +264,17 @@ void app_main(void)
             // so this is safe. Resetting after button release is NOT
             // safe because the Pi might respond before we reset.
             tts_received = 0;
-            tts_expected = 0;
             tts_done = false;
-            // Drain any stale semaphore signal from previous query
-            // (on_tts_chunk could have given it at size threshold)
+            tts_watermark_given = false;
+            // Drain any stale semaphore signals from previous query
             xSemaphoreTake(tts_sem, 0);
+            xSemaphoreTake(tts_watermark_sem, 0);
 
             // 1. Notify Pi: button pressed
             ble_notify_control(BLE_CMD_BUTTON_PRESSED, NULL, 0);
 
             // 2. Camera JPEG capture + send (~130ms)
-            if (cam_ok == ESP_OK) {
+            {
                 uint8_t *jpeg_buf = NULL;
                 size_t jpeg_len = 0;
                 if (camera_capture_jpeg(&jpeg_buf, &jpeg_len) == ESP_OK) {
@@ -267,26 +296,16 @@ void app_main(void)
             // 4. Notify Pi: button released
             ble_notify_control(BLE_CMD_BUTTON_RELEASED, NULL, 0);
 
-            // 5. Wait for TTS response
-            ESP_LOGI(TAG, "Waiting for TTS...");
-            if (xSemaphoreTake(tts_sem, pdMS_TO_TICKS(60000)) == pdTRUE && tts_received > 0) {
-                ESP_LOGI(TAG, "TTS received: %zu bytes, spawning speaker on Core 1", tts_received);
+            // 5. Kill camera + mic (free power rail noise sources)
+            camera_deinit();
+            mic_deinit();
 
-                // 6. Play on Core 1 (non-blocking)
-                spk_args_t *args = malloc(sizeof(spk_args_t));
-                if (args) {
-                    args->data = tts_buf;
-                    args->len = tts_received;
-                    args->sample_rate = SPK_SAMPLE_RATE;
-                    xTaskCreatePinnedToCore(speaker_task, "spk", 32768,
-                                            args, 5, NULL, 0);
-                } else {
-                    xSemaphoreGive(spk_done_sem);  // no task spawned
-                }
-            } else {
-                ESP_LOGW(TAG, "No TTS received (timeout)");
-                xSemaphoreGive(spk_done_sem);  // no playback needed
-            }
+            // 6. Spawn speaker task on Core 1
+            // Task handles: wait for watermark → speaker_init → streaming playback
+            //   → speaker_deinit → camera_init + mic_init → spk_done_sem
+            ESP_LOGI(TAG, "Spawning speaker task...");
+            xTaskCreatePinnedToCore(speaker_task, "spk", 32768,
+                                    (void *)(intptr_t)SPK_SAMPLE_RATE, 5, NULL, 0);
 
             // Wait for button release
             while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(50));
