@@ -1,15 +1,17 @@
-# Helios Test Bench dependencies
+# Helios BLE Voice + Vision Server
 # Install: pip install -r requirements.txt
 
-# Server (Pi-side)
-fastapi>=0.100.0
-uvicorn>=0.23.0
+# BLE
+bleak>=0.21.0
+
+# APIs
+anthropic>=0.40.0
 httpx>=0.24.0
 websockets>=11.0
-python-dotenv>=1.0.0
 
-# Client (ESP32 simulator)
-requests>=2.31.0
-sounddevice>=0.4.6
+# Audio
+opuslib>=3.0.1
 numpy>=1.24.0
-pynput>=1.7.6
+
+# Config
+python-dotenv>=1.0.0

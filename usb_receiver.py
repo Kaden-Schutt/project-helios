@@ -44,7 +44,22 @@ def play_pcm(pcm_bytes, sample_rate=16000):
     sd.wait()
 
 
-def send_to_server(jpeg_path, pcm_path):
+def send_tts_to_esp32(ser, pcm_bytes):
+    """Send TTS PCM audio back to ESP32 over serial."""
+    if not pcm_bytes:
+        print("  (no TTS audio to send)")
+        return
+
+    b64 = base64.b64encode(pcm_bytes).decode()
+    line = f"HELIOS_TTS:{b64}\n"
+    duration = len(pcm_bytes) / 2 / 16000
+    print(f"  Sending TTS to ESP32: {len(pcm_bytes):,} bytes ({duration:.1f}s audio, {len(b64)//1024}KB b64)")
+    ser.write(line.encode())
+    ser.flush()
+    print(f"  TTS sent to ESP32.")
+
+
+def send_to_server(jpeg_path, pcm_path, ser=None):
     with open(jpeg_path, "rb") as f:
         image_b64 = base64.b64encode(f.read()).decode()
     with open(pcm_path, "rb") as f:
@@ -78,7 +93,11 @@ def send_to_server(jpeg_path, pcm_path):
         with open(tts_path, "wb") as f:
             f.write(resp.content)
 
-        play_pcm(resp.content)
+        # Send TTS audio back to ESP32 if serial connection provided
+        if ser:
+            send_tts_to_esp32(ser, resp.content)
+        else:
+            play_pcm(resp.content)
 
     except requests.exceptions.ConnectionError:
         print("  ERROR: Server not reachable. Start it with: python server.py")
@@ -121,7 +140,9 @@ def main():
         print(f"  Server:    {SERVER_URL}")
     print(f"\n  Press the button on the ESP32 to capture...\n")
 
-    ser = serial.Serial(port, 115200, timeout=0.5)
+    ser = serial.Serial(port, 115200, timeout=0.5, dsrdtr=False, rtscts=False)
+    ser.setDTR(False)
+    ser.setRTS(False)
     ser.reset_input_buffer()
     capture_num = 0
 
@@ -176,6 +197,9 @@ def main():
                 capture_num += 1
                 ts = time.strftime("%Y%m%d_%H%M%S")
 
+                jpeg_path = None
+                pcm_path = None
+
                 if jpeg_data:
                     jpeg_path = os.path.join(OUTPUT_DIR, f"capture_{ts}.jpg")
                     with open(jpeg_path, "wb") as f:
@@ -190,8 +214,8 @@ def main():
                         f.write(pcm_data)
                     print(f"  Saved: {pcm_path} ({len(pcm_data)} bytes)")
 
-                if args.send and jpeg_data and pcm_data:
-                    send_to_server(jpeg_path, pcm_path)
+                if args.send and jpeg_path and pcm_path:
+                    send_to_server(jpeg_path, pcm_path, ser=ser)
 
                 jpeg_data = None
                 pcm_data = None
