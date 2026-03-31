@@ -170,31 +170,36 @@ static void on_control(uint8_t cmd, const uint8_t *payload, size_t payload_len)
     case BLE_CMD_ERROR:
         ESP_LOGW(TAG, "Pi error: %.*s", (int)payload_len, (const char *)payload);
         break;
+    case BLE_CMD_REQUEST_STATUS: {
+        uint8_t status_payload[3];
+        status_payload[0] = (uint8_t)speaker_get_volume();
+        uint16_t heap_kb = (uint16_t)(esp_get_free_heap_size() / 1024);
+        status_payload[1] = heap_kb & 0xFF;
+        status_payload[2] = (heap_kb >> 8) & 0xFF;
+        ble_notify_control(BLE_CMD_DEVICE_STATUS, status_payload, 3);
+        ESP_LOGI(TAG, "Status requested: vol=%d%% heap=%uKB", status_payload[0], heap_kb);
+        break;
+    }
     }
 }
 
 void app_main(void)
 {
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
     printf("\n========================================\n");
     printf("  HELIOS — BLE Voice + Vision Assistant\n");
     printf("========================================\n\n");
+#endif
 
     // Init peripherals (speaker deferred — only init'd during playback)
     ESP_LOGI(TAG, "Initializing mic...");
     esp_err_t mic_ok = mic_init();
 
-    ESP_LOGI(TAG, "Initializing SD card...");
-    esp_err_t sd_ok = sdcard_init();
-
     ESP_LOGI(TAG, "Initializing camera...");
     esp_err_t cam_ok = camera_init();
 
-    // Load config
-    if (sd_ok == ESP_OK) {
-        config_load(&cfg);
-    } else {
-        config_defaults(&cfg);
-    }
+    // Load config from NVS
+    config_load(&cfg);
 
     button_init();
 
@@ -208,14 +213,15 @@ void app_main(void)
     ESP_LOGI(TAG, "Initializing BLE...");
     esp_err_t ble_ok = ble_init(on_tts_chunk, on_control);
 
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
     printf("  Mic:     %s\n", mic_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Speaker: deferred (init during playback)\n");
-    printf("  SD Card: %s\n", sd_ok == ESP_OK ? "OK" : "FAILED");
     printf("  Camera:  %s\n", cam_ok == ESP_OK ? "OK" : "FAILED");
     printf("  BLE:     %s\n", ble_ok == ESP_OK ? "OK" : "FAILED");
     printf("  TTS buf: %s\n", tts_buf ? "OK (256KB PSRAM)" : "FAILED");
     printf("  Volume:  %d%%\n", cfg.speaker_volume);
     printf("  Heap:    %lu KB free\n", (unsigned long)(esp_get_free_heap_size() / 1024));
+#endif
 
     // Button idle level: use saved or sample now (no delay)
     if (cfg.button_idle_level >= 0) {
@@ -228,22 +234,30 @@ void app_main(void)
         }
         button_idle_level = (high >= 5) ? 1 : 0;
         cfg.button_idle_level = button_idle_level;
-        if (sd_ok == ESP_OK) config_save(&cfg);
+        config_save(&cfg);
     }
 
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
     printf("  Waiting for BLE...\n");
+#endif
     while (!ble_is_connected()) {
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
     printf("  Ready.\n\n");
+#endif
 
     // --- Main voice loop ---
     while (1) {
         if (!ble_is_connected()) {
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
             printf("  BLE disconnected. Waiting...\n");
+#endif
             while (!ble_is_connected()) vTaskDelay(pdMS_TO_TICKS(500));
+#if !defined(LOG_LOCAL_LEVEL) || LOG_LOCAL_LEVEL > ESP_LOG_NONE
             printf("  Reconnected!\n\n");
+#endif
         }
 
         if (button_pressed()) {
@@ -304,8 +318,15 @@ void app_main(void)
             // Task handles: wait for watermark → speaker_init → streaming playback
             //   → speaker_deinit → camera_init + mic_init → spk_done_sem
             ESP_LOGI(TAG, "Spawning speaker task...");
-            xTaskCreatePinnedToCore(speaker_task, "spk", 32768,
-                                    (void *)(intptr_t)SPK_SAMPLE_RATE, 5, NULL, 0);
+            BaseType_t spk_rc = xTaskCreatePinnedToCore(
+                speaker_task, "spk", 32768,
+                (void *)(intptr_t)SPK_SAMPLE_RATE, 5, NULL, 0);
+            if (spk_rc != pdPASS) {
+                ESP_LOGE(TAG, "Speaker task creation failed! Restoring peripherals.");
+                camera_init();
+                mic_init();
+                xSemaphoreGive(spk_done_sem);
+            }
 
             // Wait for button release
             while (button_pressed()) vTaskDelay(pdMS_TO_TICKS(50));

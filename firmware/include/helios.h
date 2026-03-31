@@ -42,18 +42,6 @@ esp_err_t mic_init(void);
 void      mic_deinit(void);
 void      mic_free_buf(uint8_t *buf);
 
-// --- SD Card (onboard Sense board slot, SPI mode) ---
-#define SD_CS_PIN       21  // internal to Sense board
-#define SD_SCK_PIN      7   // D8
-#define SD_MISO_PIN     8   // D9
-#define SD_MOSI_PIN     9   // D10
-#define SD_MOUNT_POINT  "/sdcard"
-
-// --- SD Card API ---
-esp_err_t sdcard_init(void);
-void      sdcard_unmount(void);
-bool      sdcard_is_mounted(void);
-
 // --- Speaker (MAX98357A via I2S STD) ---
 #define SPK_LRC_PIN     5   // D4 — WS / word select
 #define SPK_BCLK_PIN    6   // D5 — bit clock
@@ -86,6 +74,7 @@ esp_err_t speaker_stop(void);
 #define BLE_CMD_PROCESSING      0x02
 #define BLE_CMD_SET_VOLUME      0x03
 #define BLE_CMD_ERROR           0x04
+#define BLE_CMD_REQUEST_STATUS  0x05
 
 // Control commands (ESP → Pi)
 #define BLE_CMD_BUTTON_PRESSED  0x10
@@ -105,17 +94,12 @@ esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms);
 esp_err_t ble_notify_control(uint8_t cmd, const uint8_t *payload, size_t payload_len);
 void      ble_start_advertising(void);
 
-// --- Config (persistent JSON on SD card) ---
+// --- Config (persistent in NVS flash) ---
 typedef struct {
-    int   speaker_volume;       // 0-100, default 60
+    int   speaker_volume;       // 0-100, default 50
     int   button_idle_level;    // 0 or 1, -1 = auto-detect
-    char  device_name[32];      // BLE advertising name
-    char  tts_voice_id[64];     // Cartesia voice ID
-    int   tts_sample_rate;      // 16000 or 24000
 } helios_config_t;
 
 esp_err_t config_load(helios_config_t *cfg);
 esp_err_t config_save(const helios_config_t *cfg);
 void      config_defaults(helios_config_t *cfg);
-esp_err_t bonds_backup_to_sd(void);
-esp_err_t bonds_restore_from_sd(void);

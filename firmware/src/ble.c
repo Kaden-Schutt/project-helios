@@ -177,9 +177,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGI(TAG, "Encryption changed: status=%d", event->enc_change.status);
-        if (event->enc_change.status == 0) {
-            bonds_backup_to_sd();
-        }
         break;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
@@ -252,9 +249,6 @@ esp_err_t ble_init(ble_tts_chunk_cb tts_cb, ble_control_cb ctrl_cb)
         nvs_flash_erase();
         nvs_flash_init();
     }
-
-    // Try restoring bonds from SD
-    bonds_restore_from_sd();
 
     // Init NimBLE
     err = nimble_port_init();
@@ -335,20 +329,28 @@ esp_err_t ble_send_jpeg(const uint8_t *jpeg, size_t len)
 
     // Send JPEG data in chunks — pace every chunk to prevent BLE drops
     size_t sent = 0;
+    bool send_failed = false;
     while (sent < len) {
         size_t chunk = (len - sent > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : (len - sent);
         int retries = 0;
+        bool chunk_ok = false;
         while (retries < 20) {
             om = ble_hs_mbuf_from_flat(jpeg + sent, chunk);
             if (!om) { vTaskDelay(pdMS_TO_TICKS(10)); retries++; continue; }
             int rc = ble_gatts_notify_custom(s_conn_handle, s_mic_chr_handle, om);
-            if (rc == 0) break;
+            if (rc == 0) { chunk_ok = true; break; }
             if (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY) {
                 os_mbuf_free_chain(om);
                 vTaskDelay(pdMS_TO_TICKS(20));
                 retries++;
                 continue;
             }
+            ESP_LOGE(TAG, "JPEG chunk send failed: rc=%d", rc);
+            break;
+        }
+        if (!chunk_ok) {
+            ESP_LOGE(TAG, "JPEG send aborted at %zu/%zu bytes", sent, len);
+            send_failed = true;
             break;
         }
         sent += chunk;
@@ -357,8 +359,9 @@ esp_err_t ble_send_jpeg(const uint8_t *jpeg, size_t len)
 
     // Gap before Opus marker to prevent it being dropped
     vTaskDelay(pdMS_TO_TICKS(30));
-    ESP_LOGI(TAG, "Sent %zu bytes JPEG over BLE", sent);
-    return ESP_OK;
+    ESP_LOGI(TAG, "Sent %zu/%zu bytes JPEG over BLE%s", sent, len,
+             send_failed ? " (INCOMPLETE)" : "");
+    return send_failed ? ESP_FAIL : ESP_OK;
 }
 
 esp_err_t ble_stream_mic_opus(mic_keep_recording_fn keep_going, int max_ms)
