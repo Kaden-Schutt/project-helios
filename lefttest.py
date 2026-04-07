@@ -1,3 +1,23 @@
+"""
+Pi GPIO Sensor Test — Ultrasonic + Buzzer + Rear Motor
+========================================================
+Runs on Raspberry Pi 4B. Tests up to 3 HC-SR04 ultrasonic sensors with
+non-blocking buzzer control and PWM vibration motor for rear detection.
+
+This is a standalone test script for Mohamed's Pi-side safety loop.
+The production safety loop runs on RP2040 boards instead (safety_loop_rp2040.py).
+
+Hardware:
+  Left sensor:   TRIG=GPIO17, ECHO=GPIO27
+  Right sensor:  TRIG=GPIO22, ECHO=GPIO23  (known issue: GPIO22/23 unreliable)
+  Rear sensor:   TRIG=GPIO5,  ECHO=GPIO6   (known issue: erratic readings)
+  Left buzzer:   GPIO20
+  Right buzzer:  GPIO21
+  Rear motor:    GPIO12 (PWM, proportional vibration intensity)
+
+Run:  sudo python3 lefttest.py
+Note: Requires root or gpio group for RPi.GPIO access on Bookworm.
+"""
 import RPi.GPIO as GPIO
 import time
 

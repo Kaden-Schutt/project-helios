@@ -1,11 +1,30 @@
 """
 Helios BLE Voice + Vision Server
 ==================================
-BLE central connects to ESP32 Helios peripheral.
-Receives multiplexed JPEG + Opus mic via notifications.
-Runs STT → Claude Haiku (vision) → TTS → Opus encode → BLE write.
+Runs on the Raspberry Pi 4B (belt unit). Acts as a BLE central that connects
+to the ESP32S3 Sense pendant (BLE peripheral named "Helios").
 
-Run:  python server_ble.py
+Pipeline (triggered by button press on pendant):
+  1. ESP32 captures JPEG from camera + Opus audio from mic
+  2. ESP32 sends multiplexed JPEG + Opus stream over BLE notifications
+  3. This server demultiplexes the stream (see _on_mic_notify)
+  4. Opus audio → PCM → Cartesia Ink-Whisper STT → text transcript
+  5. Transcript + JPEG → Anthropic Claude Haiku (vision LLM) → response text
+  6. Response text → Cartesia Sonic 3 TTS → PCM → Opus encode
+  7. Opus frames sent back to ESP32 over BLE → speaker playback
+
+BLE Protocol:
+  - 4 GATT characteristics under one custom service
+  - MIC_TX (notify): ESP32 → Pi, carries JPEG then Opus mic data
+  - SPEAKER_RX (write): Pi → ESP32, carries Opus TTS audio
+  - CONTROL (notify+write): bidirectional command channel
+  - Multiplexing markers: 0xFFFFFFFE = JPEG start, 0xFFFFFFFF = Opus start
+
+Dependencies: bleak, opuslib (requires libopus), httpx, websockets, anthropic
+Environment: .env file with CARTESIA_API_KEY, ANTHROPIC_API_KEY
+
+Run:    python server_ble.py
+Debug:  python server_ble.py --debug
 """
 
 import asyncio
@@ -36,8 +55,9 @@ _args = _parser.parse_args()
 load_dotenv()
 
 # --- Config ---
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# API keys loaded from .env file (never committed to git)
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")   # For STT + TTS
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # For Claude Haiku LLM
 
 STT_MODEL = "ink-whisper"
 STT_SAMPLE_RATE = 16000
@@ -58,27 +78,29 @@ STRICT RULES:
 - Describe what matters most to the user's safety or question.
 - If asked to identify something, name it immediately."""
 
-# BLE UUIDs
-SERVICE_UUID    = "87654321-4321-4321-4321-cba987654321"
-MIC_TX_UUID     = "87654321-4321-4321-4321-cba987654322"
-SPEAKER_RX_UUID = "87654321-4321-4321-4321-cba987654323"
-CONTROL_UUID    = "87654321-4321-4321-4321-cba987654324"
+# BLE UUIDs — must match the ESP32 firmware (ble.c)
+SERVICE_UUID    = "87654321-4321-4321-4321-cba987654321"  # Main Helios service
+MIC_TX_UUID     = "87654321-4321-4321-4321-cba987654322"  # ESP→Pi: JPEG + mic audio
+SPEAKER_RX_UUID = "87654321-4321-4321-4321-cba987654323"  # Pi→ESP: TTS audio
+CONTROL_UUID    = "87654321-4321-4321-4321-cba987654324"  # Bidirectional commands
 
 DEVICE_NAME = "Helios"
-BLE_CHUNK_SIZE = 509
+BLE_CHUNK_SIZE = 509  # MTU 512 - 3 bytes ATT header = 509 bytes max payload
 
-# Control commands
-CMD_CONNECTED       = 0x01
-CMD_PROCESSING      = 0x02
-CMD_SET_VOLUME      = 0x03
-CMD_ERROR           = 0x04
-CMD_REQUEST_STATUS  = 0x05
-CMD_BUTTON_PRESSED  = 0x10
-CMD_BUTTON_RELEASED = 0x11
-CMD_PLAYBACK_DONE   = 0x12
-CMD_DEVICE_STATUS   = 0x13
+# Control commands (Pi → ESP32)
+CMD_CONNECTED       = 0x01  # Pi has connected
+CMD_PROCESSING      = 0x02  # Pi is running STT/LLM/TTS pipeline
+CMD_SET_VOLUME      = 0x03  # Set speaker volume (payload: uint8 0-100)
+CMD_ERROR           = 0x04  # Error message (payload: ASCII string)
+CMD_REQUEST_STATUS  = 0x05  # Request device status report
 
-CONVERSATION_TIMEOUT = 300
+# Control commands (ESP32 → Pi)
+CMD_BUTTON_PRESSED  = 0x10  # User pressed the query button
+CMD_BUTTON_RELEASED = 0x11  # User released the query button
+CMD_PLAYBACK_DONE   = 0x12  # Speaker finished playing TTS
+CMD_DEVICE_STATUS   = 0x13  # Status report (vol, heap, etc.)
+
+CONVERSATION_TIMEOUT = 300  # Seconds before conversation history auto-clears
 
 logging.basicConfig(
     level=logging.DEBUG if _args.debug else logging.WARNING,
@@ -228,7 +250,10 @@ async def tts_synthesize(text: str) -> bytes:
 
 
 # --- TTS Streaming (Cartesia WebSocket → Opus → BLE) ---
-TTS_STREAM_WATERMARK = 900  # ~300ms of Opus at 24kbps before starting BLE send
+# Watermark: accumulate this many bytes of Opus before starting BLE transmission.
+# This buffers ~300ms of audio so the ESP32 speaker doesn't starve waiting for
+# the next BLE packet. Balances latency vs. smooth playback.
+TTS_STREAM_WATERMARK = 900
 
 async def tts_stream_and_send(text: str, helios: "HeliosClient"):
     """Stream TTS: Cartesia WebSocket → Opus encode → 300ms buffer → BLE stream."""

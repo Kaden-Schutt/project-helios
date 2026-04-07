@@ -1,25 +1,45 @@
 """
-Safety Loop — Smart obstacle alert for RP2040
-================================================
-State-machine approach: only alerts on approaching objects.
+Safety Loop — Smart obstacle alert for RP2040 (MicroPython)
+=============================================================
+Runs on RP2040 (Raspberry Pi Pico) as the forward safety system for
+Project Helios. This is one of three independent safety modules — each
+has its own sensor and buzzer, runs on battery, no network needed.
 
-States:
-  IDLE     — nothing in range, silent
-  NOTICED  — object entered 100cm, one beep sent, watching
-  TRACKING — object breached 70cm or approaching fast, tiered beeping
+Design philosophy: "parking sensor" style — don't annoy the user with
+constant beeping for static objects (walls, furniture). Only alert when
+something is actually approaching or dangerously close.
 
-Transitions:
-  IDLE → NOTICED:   object detected <100cm and closing
-  NOTICED → IDLE:   object left or stopped approaching (after notify beep)
-  NOTICED → TRACKING: object breaches 70cm
-  TRACKING → IDLE:  object leaves 100cm
-  Any → IDLE:       no reading for 500ms
+State Machine:
+  IDLE     — nothing in range (<100cm), buzzer silent
+  NOTICED  — object entered 100cm AND closing at >15cm/s
+             → plays 3 quick notification pulses
+             → if object stops approaching, returns to IDLE
+  TRACKING — object breached 70cm inner boundary
+             → tiered beeping based on distance (parking sensor style)
+             → if object holds still for 5s, goes quiet (STATIC mode)
+             → if object moves again, beeping resumes
 
-Wiring:
-  Sensor:  TRIG=GP0, ECHO=GP1
-  Buzzer:  GP8 (or LED for testing)
+Distance Zones (TRACKING state only):
+  <20cm  = DANGER  — solid buzzer (stop!)
+  <40cm  = CLOSE   — 100ms rapid beep
+  <70cm  = WARNING — 300ms moderate beep
+  <100cm = FAR     — 600ms slow beep
+  >100cm = CLEAR   — silent
 
-Copy to RP2040: mpremote cp safety_loop_rp2040.py :main.py
+Anti-false-trigger measures:
+  - 10-sample rolling history for smoothed distance + velocity
+  - Approach velocity threshold (-15cm/s) exceeds sensor jitter (~6cm/s)
+  - 3 consecutive approaching readings required before NOTICED
+  - Static suppression: objects still for 5s stop beeping
+  - Distance-range stability check (not velocity) for static detection
+
+Hardware:
+  Sensor:  HC-SR04 ultrasonic — TRIG=GP0, ECHO=GP1
+  Buzzer:  Active-low 3-pin buzzer — GP8 (LOW=beep, HIGH=silent)
+  Power:   3.3V from Pico or external battery
+
+Deploy: mpremote cp safety_loop_rp2040.py :main.py
+        (auto-runs on boot from any power source)
 """
 
 import machine
@@ -34,14 +54,20 @@ trig.value(0)
 buzzer.value(1)  # active-low: start silent
 
 # --- Config ---
-NOTICE_DIST = 100       # cm — outer detection boundary
-TRACK_DIST = 70         # cm — inner boundary, activates tiered beeping
-APPROACH_RATE = -15.0   # cm/s — negative = closing, must exceed sensor jitter (~6cm/s)
-HISTORY_SIZE = 10       # larger window for better smoothing
-APPROACH_COUNT = 3      # consecutive approaching readings before triggering
-NO_READING_TIMEOUT = 500  # ms before resetting to IDLE on lost signal
-STATIC_TIMEOUT = 5000    # ms — if object holds steady in TRACKING, go quiet
-STATIC_THRESHOLD = 8.0   # cm/s — abs velocity below this = "not moving"
+# --- Tunable parameters ---
+# These control sensitivity. Adjust based on real-world testing.
+NOTICE_DIST = 100       # cm — outer boundary. Objects beyond this are ignored.
+TRACK_DIST = 70         # cm — inner boundary. Crossing this activates tiered beeping.
+APPROACH_RATE = -15.0   # cm/s — how fast an object must approach to trigger NOTICED.
+                        #         Negative = closing. Set above jitter floor (~6cm/s).
+HISTORY_SIZE = 10       # Number of distance samples in rolling window.
+                        #         Larger = smoother but slower to react.
+APPROACH_COUNT = 3      # Consecutive approaching readings needed before triggering.
+                        #         Prevents single-sample false positives.
+NO_READING_TIMEOUT = 500  # ms — if sensor returns no reading for this long, reset to IDLE.
+STATIC_TIMEOUT = 5000    # ms — if object holds still this long in TRACKING, go quiet.
+STATIC_THRESHOLD = 8.0   # cm/s — unused (kept for reference). Static detection now uses
+                         #         distance-range method instead of velocity.
 
 # Tiered beep zones (only active in TRACKING state)
 ZONES = [
@@ -77,22 +103,30 @@ last_toggle = time.ticks_ms()
 
 
 def get_distance():
+    """Measure distance using HC-SR04 ultrasonic sensor.
+
+    Sends a 10us trigger pulse, then times how long the echo pin stays high.
+    Sound travels at ~343m/s, so distance = (pulse_us * 0.0343) / 2 = pulse * 0.01715 cm.
+    Returns None if no echo received within 25ms (~4.3m max range).
+    """
     trig.value(1)
     time.sleep_us(10)
     trig.value(0)
 
+    # Wait for echo pin to go HIGH (start of return pulse)
     t0 = time.ticks_us()
     while echo.value() == 0:
-        if time.ticks_diff(time.ticks_us(), t0) > 25000:
+        if time.ticks_diff(time.ticks_us(), t0) > 25000:  # 25ms timeout
             return None
 
+    # Measure how long echo stays HIGH
     start = time.ticks_us()
     while echo.value() == 1:
         if time.ticks_diff(time.ticks_us(), start) > 25000:
             return None
 
     pulse = time.ticks_diff(time.ticks_us(), start)
-    return pulse * 0.01715
+    return pulse * 0.01715  # Convert microseconds to centimeters
 
 
 def avg_distance():
