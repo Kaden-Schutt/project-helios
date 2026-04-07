@@ -372,7 +372,16 @@ esp_err_t speaker_play_opus_stream(const uint8_t *buf, size_t buf_size,
         }
 
         size_t bw = 0;
-        i2s_channel_write(s_tx_chan, out_buf, n_out * 2, &bw, portMAX_DELAY);
+        esp_err_t write_err = i2s_channel_write(s_tx_chan, out_buf, n_out * 2, &bw, portMAX_DELAY);
+        if (write_err != ESP_OK) {
+            ESP_LOGE(TAG, "I2S write failed on stream frame %zu: 0x%x", frame_idx, write_err);
+            break;
+        }
+        if (bw != n_out * 2) {
+            ESP_LOGE(TAG, "Short I2S write on stream frame %zu: wrote=%zu expected=%zu",
+                     frame_idx, bw, n_out * 2);
+            break;
+        }
         frame_idx++;
     }
 

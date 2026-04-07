@@ -598,9 +598,6 @@ class HeliosClient:
             log.error(f"Connection failed: {e}")
             return False
 
-        if hasattr(self.client, 'mtu_size'):
-            log.info(f"MTU: {self.client.mtu_size}")
-
         try:
             await self.client.start_notify(MIC_TX_UUID, self._on_mic_notify)
             log.info("Subscribed to Mic TX")
@@ -613,10 +610,20 @@ class HeliosClient:
         except Exception as e:
             log.error(f"Control notify subscribe failed: {e}")
 
-        try:
-            await self.client.write_gatt_char(CONTROL_UUID, bytes([CMD_CONNECTED]), response=False)
-        except Exception as e:
-            log.error(f"Control write failed: {e}")
+        # On bluez, MTU is negotiated when AcquireNotify/AcquireWrite happens
+        # (i.e. after start_notify). Check it now.
+        mtu = self.client.mtu_size if hasattr(self.client, 'mtu_size') else 23
+        log.info(f"MTU: {mtu}")
+        if mtu < 200:
+            log.warning(f"MTU is only {mtu} — trying explicit request")
+            try:
+                # Force an ATT Exchange MTU Request by writing to a characteristic
+                await self.client.write_gatt_char(CONTROL_UUID, bytes([CMD_CONNECTED]), response=True)
+                await asyncio.sleep(0.5)
+                mtu = self.client.mtu_size if hasattr(self.client, 'mtu_size') else 23
+                log.info(f"MTU after write-with-response: {mtu}")
+            except Exception as e:
+                log.warning(f"MTU request failed: {e}")
 
         log.info(f"Connected to {device.name} [{device.address}]")
         return True
@@ -735,8 +742,8 @@ class HeliosClient:
                     transcript, conversation["history"], self.jpeg_b64)
 
                 # Update conversation
-                conversation["history"].append({"role": "user", "content": transcript})
-                conversation["history"].append({"role": "assistant", "content": response_text})
+                # One-shot: no conversation history for now
+                conversation["history"] = []
                 conversation["last_time"] = time.time()
 
                 # TTS → Opus → BLE (streaming)
