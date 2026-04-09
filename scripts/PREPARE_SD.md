@@ -95,37 +95,84 @@ curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/project-helios/main/sc
 ## The "Swap SD in Class" Strategy
 
 The provided Pi 4B in class has a bloated Raspberry Pi OS install with a
-full desktop and cruft from old projects. For the demo, you can bring your
-own pre-configured SD card and swap it in.
+full desktop and cruft from old projects. For the demo, bring your own
+pre-configured SD card and swap it in.
 
-### Workflow
+### How WiFi credentials work on your SD
+
+Your preconfigured SD has a `helios-wifi-import` systemd service that
+runs at boot. It reads `/boot/firmware/wifi.conf` (a plain text file on
+the FAT32 boot partition, **mountable from any OS**) and imports each
+listed network into NetworkManager. Format:
+
+```ini
+[SSID Name]
+psk=password
+priority=100
+
+[Another Network]
+psk=anotherpass
+```
+
+This means you never need to read the Linux rootfs to update WiFi —
+just mount the boot partition on Mac, edit `wifi.conf`, eject, swap.
+
+### Workflow — no GUI required
 
 **Before class** (at home):
-1. Prepare your SD card as above, verify Helios runs end-to-end on battery
-2. Make sure all three SSIDs are pre-configured in `wpa_supplicant.conf`:
-   - Your home WiFi (for final testing)
-   - Your phone hotspot (backup + class)
-   - `asu guest` is a **captive portal** — won't work headless, skip it
-3. Test boot-to-service-running time — should be under 60s
-4. Label your SD card clearly
+1. Prepare your SD with `setup.sh`. Verify Helios runs end-to-end on battery.
+2. Edit `/Volumes/bootfs/wifi.conf` to include:
+   - Your phone hotspot (highest priority — fallback that always works)
+   - Your home WiFi
+3. Test boot-to-service-running time. Should be under 60s.
+4. Label your SD card clearly.
 
-**In class**:
-1. Power off the provided Pi 4B cleanly (`sudo shutdown -h now` if accessible)
-2. Unplug power
-3. Remove the original SD, place it in a labeled container (you MUST return it)
-4. Insert your SD
-5. Power on — expect 30-45s boot time
-6. Tether the Pi to your phone hotspot if needed (the `helios-ble` service
-   doesn't need internet to talk to the ESP32, but the Cartesia/Anthropic
-   APIs do)
-7. `ssh pi@helios.local` or whatever IP your hotspot assigned
+**In class — Option 1: just use your hotspot (recommended)**
+1. Turn on your phone hotspot.
+2. Power off the provided Pi 4B (`sudo shutdown -h now` or pull power if you must).
+3. Pop out the original SD, put it somewhere safe — you must return it.
+4. Insert your SD, power on. NetworkManager will pick your hotspot.
+5. `ssh pi@<hotspot-assigned-ip>` (find via your phone's hotspot device list).
+
+**In class — Option 2: inherit the class WiFi**
+
+If you want the Pi to use whatever network the class Pi was on, you have
+to read the credentials off its rootfs (which is ext4, not Mac-mountable
+out of the box). Three ways:
+
+- **Easiest: SSH into the running class Pi first.** Before powering it off:
+  ```bash
+  ssh pi@<class-pi-ip>
+  sudo grep -E '^(ssid|psk)=' /etc/NetworkManager/system-connections/*.nmconnection
+  ```
+  Copy SSID + psk into your SD's `wifi.conf`, eject, swap.
+
+- **Use your OrangePi as an ext4 reader.** Plug the class SD into a USB
+  reader, plug the reader into the OrangePi:
+  ```bash
+  ssh orangepi@<orangepi-ip>
+  lsblk                                       # find sda2 (the rootfs)
+  sudo mount /dev/sda2 /mnt
+  sudo bash ~/project-helios/scripts/extract-wifi.sh /mnt
+  sudo umount /mnt
+  ```
+  `extract-wifi.sh` prints credentials in helios `wifi.conf` format —
+  paste straight into your SD's boot partition.
+
+- **Install ext4fuse on your Mac** (fragile, optional):
+  ```bash
+  brew install --cask macfuse
+  brew install gromgit/fuse/ext4fuse-mac
+  ```
+  Then: `ext4fuse /dev/disk5s2 /Volumes/picross && bash extract-wifi.sh /Volumes/picross`.
+  macFUSE requires kernel-extension permissions in macOS Settings.
 
 **After class**:
-1. Power off the Pi
-2. Remove your SD
-3. Reinsert the original SD
-4. Power on to verify it still boots
-5. Hand the Pi back as you found it
+1. Power off the Pi.
+2. Remove your SD.
+3. Reinsert the original SD.
+4. Power on to verify it still boots normally.
+5. Hand the Pi back as you found it.
 
 ### Why this is better than using the provided setup
 

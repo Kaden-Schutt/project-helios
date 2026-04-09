@@ -114,6 +114,14 @@ EOF
 # --- 6. systemd services ---
 echo "[6/6] Installing systemd services..."
 
+# WiFi import helper — reads /boot/firmware/wifi.conf at boot.
+# Lets you swap WiFi credentials by editing a FAT32 file from any OS.
+if [[ -f "$HELIOS_DIR/scripts/helios-wifi-import.sh" ]]; then
+    install -m 755 "$HELIOS_DIR/scripts/helios-wifi-import.sh" /usr/local/sbin/
+    install -m 644 "$HELIOS_DIR/scripts/helios-wifi-import.service" /etc/systemd/system/
+    systemctl enable helios-wifi-import.service
+fi
+
 cat > /etc/systemd/system/helios-ble.service <<EOF
 [Unit]
 Description=Helios BLE Voice + Vision Server
