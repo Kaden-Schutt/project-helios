@@ -1,0 +1,15 @@
+[Unit]
+Description=Helios Rear Safety Loop (vibration motor)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/project-helios
+ExecStart=/usr/bin/python3 /home/pi/project-helios/rear_safety.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

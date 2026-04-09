@@ -1,0 +1,31 @@
+# Helios WiFi networks
+# =====================
+# One section per network. This file lives on the FAT32 boot partition,
+# so you can edit it from any OS (Mac, Windows, Linux) without mounting
+# the Linux rootfs. Edit, eject, insert into the Pi, boot.
+#
+# Format:
+#   [SSID]
+#   psk=password
+#   priority=100     (optional, higher = preferred)
+#
+# Priority notes: higher number wins when multiple networks are in range.
+# Leave psk empty for open networks. Lines starting with # are comments.
+
+# --- Phone hotspot (highest priority — most reliable) ---
+[Kaden's iPhone]
+psk=REPLACEME
+priority=100
+
+# --- Home network ---
+[MyHomeWiFi]
+psk=REPLACEME
+priority=90
+
+# --- Add more networks here as needed ---
+# For class: either extract credentials from the provided Pi before
+# swapping SDs, or fall back to the phone hotspot above.
+#
+# [ClassNetwork]
+# psk=extracted_from_class_pi
+# priority=80
