@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bluer::{
-    gatt::remote::{Characteristic, CharacteristicReader, CharacteristicWriter},
+    gatt::{remote::Characteristic, CharacteristicReader, CharacteristicWriter},
     Address, Session, Uuid,
 };
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
@@ -399,7 +399,7 @@ async fn reader_loop(mut reader: CharacteristicReader, uuid: String, callback: P
 
 /// Module entry point. Called once when Python imports `helios_ble`.
 #[pymodule]
-fn helios_ble(_py: Python, m: &PyModule) -> PyResult<()> {
+fn helios_ble(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HeliosBle>()?;
     m.add("MIN_MTU", MIN_MTU)?;
     Ok(())
