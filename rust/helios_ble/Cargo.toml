@@ -1,0 +1,21 @@
+[package]
+name = "helios_ble"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal PyO3 BLE transport for Helios — bypasses bleak's 23-byte MTU bug on BlueZ by using the AcquireWrite/AcquireNotify D-Bus sockets directly."
+license = "MIT"
+
+[lib]
+name = "helios_ble"
+crate-type = ["cdylib"]
+
+[dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "io-util"] }
+uuid = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
