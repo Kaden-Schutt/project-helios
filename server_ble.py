@@ -20,7 +20,7 @@ BLE Protocol:
   - CONTROL (notify+write): bidirectional command channel
   - Multiplexing markers: 0xFFFFFFFE = JPEG start, 0xFFFFFFFF = Opus start
 
-Dependencies: bleak, opuslib (requires libopus), httpx, websockets, anthropic
+Dependencies: helios_ble (Rust BLE transport), opuslib, httpx, websockets, anthropic
 Environment: .env file with CARTESIA_API_KEY, ANTHROPIC_API_KEY
 
 Run:    python server_ble.py
@@ -42,7 +42,7 @@ if os.path.exists("/opt/homebrew/lib"):
 
 import argparse
 
-from bleak import BleakClient, BleakScanner
+import helios_ble  # Rust BLE transport — replaces bleak entirely
 from dotenv import load_dotenv
 import httpx
 import websockets
@@ -85,6 +85,7 @@ SPEAKER_RX_UUID = "87654321-4321-4321-4321-cba987654323"  # Pi→ESP: TTS audio
 CONTROL_UUID    = "87654321-4321-4321-4321-cba987654324"  # Bidirectional commands
 
 DEVICE_NAME = "Helios"
+HELIOS_MAC = "90:70:69:13:01:C2"  # ESP32 BLE MAC — used by helios_ble for direct connect
 BLE_CHUNK_SIZE = 509  # MTU 512 - 3 bytes ATT header = 509 bytes max payload
 
 # Control commands (Pi → ESP32)
@@ -107,7 +108,6 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-logging.getLogger("bleak").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("helios")
@@ -332,14 +332,12 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
                             log.info(f"[TTS-STREAM] Watermark reached ({len(opus_buf)} bytes), "
                                      f"starting BLE stream")
                             # Send start marker
-                            await helios.client.write_gatt_char(
-                                SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
+                            await helios._ble_write(SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF')
                             # Send buffered data
                             offset = 0
                             while offset < len(opus_buf):
                                 end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
-                                await helios.client.write_gatt_char(
-                                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                                await helios._ble_write(SPEAKER_RX_UUID, bytes(opus_buf[offset:end]))
                                 offset = end
                             total_opus_sent += len(opus_buf)
                             opus_buf.clear()
@@ -349,8 +347,7 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
                             offset = 0
                             while offset < len(opus_buf):
                                 end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
-                                await helios.client.write_gatt_char(
-                                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                                await helios._ble_write(SPEAKER_RX_UUID, bytes(opus_buf[offset:end]))
                                 offset = end
                             total_opus_sent += len(opus_buf)
                             opus_buf.clear()
@@ -385,22 +382,20 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
 
         if not streaming:
             # Never reached watermark — send everything now
-            await helios.client.write_gatt_char(
-                SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF', response=True)
+            await helios._ble_write(SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF')
 
         # Send remaining data
         if len(opus_buf) > 0:
             offset = 0
             while offset < len(opus_buf):
                 end = min(offset + BLE_CHUNK_SIZE, len(opus_buf))
-                await helios.client.write_gatt_char(
-                    SPEAKER_RX_UUID, bytes(opus_buf[offset:end]), response=True)
+                await helios._ble_write(SPEAKER_RX_UUID, bytes(opus_buf[offset:end]))
                 offset = end
             total_opus_sent += len(opus_buf)
 
         # Empty end marker
         await asyncio.sleep(0.02)
-        await helios.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
+        await helios._ble_write(SPEAKER_RX_UUID, b'')
 
     elapsed = time.time() - t0
     duration = total_pcm / 2 / TTS_SAMPLE_RATE
@@ -413,7 +408,8 @@ async def tts_stream_and_send(text: str, helios: "HeliosClient"):
 
 class HeliosClient:
     def __init__(self):
-        self.client = None
+        self.ble = helios_ble.HeliosBle()
+        self.loop = None  # Set on connect — needed for thread-safe scheduling
         self.ble_write_lock = asyncio.Lock()
         # Mic stream state
         self.mic_buffer = bytearray()
@@ -501,8 +497,11 @@ class HeliosClient:
             self.stt_ws = None
         return " ".join(self.stt_transcript_parts)
 
-    def _on_mic_notify(self, sender, data: bytearray):
-        """Demux multiplexed stream: JPEG (0xFFFFFFFE) then Opus (0xFFFFFFFF)."""
+    def _on_mic_notify(self, uuid_str, data):
+        """Demux multiplexed stream: JPEG (0xFFFFFFFE) then Opus (0xFFFFFFFF).
+        Called from the helios_ble Rust reader thread, so any asyncio
+        interaction must go through call_soon_threadsafe."""
+        data = bytearray(data)
         # Empty = end of stream
         if len(data) == 0:
             if self.mic_opus_mode and self.opus_dec:
@@ -510,7 +509,8 @@ class HeliosClient:
                          f"{len(self.mic_buffer):,} bytes PCM")
             self.mic_receiving = False
             self.mic_opus_mode = False
-            self.query_event.set()
+            if self.loop:
+                self.loop.call_soon_threadsafe(self.query_event.set)
             return
 
         # --- JPEG receiving mode ---
@@ -583,7 +583,9 @@ class HeliosClient:
                 except Exception as e:
                     log.warning(f"[MIC] Opus decode error: {e}")
 
-    def _on_control_notify(self, sender, data: bytearray):
+    def _on_control_notify(self, uuid_str, data):
+        """Called from the helios_ble Rust reader thread."""
+        data = bytearray(data)
         if len(data) == 0:
             return
         cmd = data[0]
@@ -591,7 +593,9 @@ class HeliosClient:
             log.info("[ESP32] Button pressed -- recording...")
             self.record_start_time = time.time()
             self.jpeg_b64 = None
-            asyncio.get_running_loop().create_task(self._open_stt_stream())
+            # Schedule the async STT stream open on the main loop from this thread.
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(self._open_stt_stream(), self.loop)
         elif cmd == CMD_BUTTON_RELEASED:
             log.info("[ESP32] Button released")
             # Fallback: if mic stream never sent end marker, trigger query now
@@ -599,7 +603,8 @@ class HeliosClient:
                 log.warning("[ESP32] No mic end marker received — triggering query from BUTTON_RELEASED")
                 self.mic_receiving = False
                 self.mic_opus_mode = False
-                self.query_event.set()
+                if self.loop:
+                    self.loop.call_soon_threadsafe(self.query_event.set)
         elif cmd == CMD_PLAYBACK_DONE:
             log.info("[ESP32] Playback finished")
         elif cmd == CMD_DEVICE_STATUS:
@@ -609,49 +614,49 @@ class HeliosClient:
                 print(f"  [ESP32] Volume: {vol}%, Heap: {heap_kb}KB, BLE: connected")
 
     async def connect(self):
-        log.info("Scanning for Helios...")
-        device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=30.0)
-        if not device:
-            log.error("Helios not found!")
-            return False
+        # Capture the asyncio loop so notification callbacks (which fire from
+        # the Rust reader thread) can schedule work back onto the main loop.
+        self.loop = asyncio.get_running_loop()
 
-        log.info(f"Found Helios at {device.address}, connecting...")
-        self.client = BleakClient(device, timeout=30.0)
+        log.info(f"Connecting to Helios at {HELIOS_MAC}...")
         try:
-            await self.client.connect()
+            # helios_ble.connect is sync (uses tokio internally). Run it in
+            # the executor so the asyncio loop isn't blocked during the
+            # discover/connect/MTU-exchange dance.
+            mtu = await self.loop.run_in_executor(
+                None,
+                self.ble.connect,
+                HELIOS_MAC,
+                [SPEAKER_RX_UUID, CONTROL_UUID],  # write chars trigger MTU exchange
+            )
+            log.info(f"Connected with MTU {mtu}")
         except Exception as e:
             log.error(f"Connection failed: {e}")
             return False
 
+        # Subscribe to notifications. The callbacks fire from the Rust
+        # reader task — they cannot directly await asyncio things, so
+        # they use loop.call_soon_threadsafe / run_coroutine_threadsafe.
         try:
-            await self.client.start_notify(MIC_TX_UUID, self._on_mic_notify)
+            await self.loop.run_in_executor(
+                None, self.ble.start_notify, MIC_TX_UUID, self._on_mic_notify)
             log.info("Subscribed to Mic TX")
         except Exception as e:
             log.error(f"Mic notify subscribe failed: {e}")
 
         try:
-            await self.client.start_notify(CONTROL_UUID, self._on_control_notify)
+            await self.loop.run_in_executor(
+                None, self.ble.start_notify, CONTROL_UUID, self._on_control_notify)
             log.info("Subscribed to Control")
         except Exception as e:
             log.error(f"Control notify subscribe failed: {e}")
 
-        # On bluez, MTU is negotiated when AcquireNotify/AcquireWrite happens
-        # (i.e. after start_notify). Check it now.
-        mtu = self.client.mtu_size if hasattr(self.client, 'mtu_size') else 23
-        log.info(f"MTU: {mtu}")
-        if mtu < 200:
-            log.warning(f"MTU is only {mtu} — trying explicit request")
-            try:
-                # Force an ATT Exchange MTU Request by writing to a characteristic
-                await self.client.write_gatt_char(CONTROL_UUID, bytes([CMD_CONNECTED]), response=True)
-                await asyncio.sleep(0.5)
-                mtu = self.client.mtu_size if hasattr(self.client, 'mtu_size') else 23
-                log.info(f"MTU after write-with-response: {mtu}")
-            except Exception as e:
-                log.warning(f"MTU request failed: {e}")
-
-        log.info(f"Connected to {device.name} [{device.address}]")
+        log.info(f"Connected to Helios [{HELIOS_MAC}]")
         return True
+
+    async def _ble_write(self, char_uuid: str, data):
+        """Async wrapper around the sync helios_ble.write call."""
+        await self.loop.run_in_executor(None, self.ble.write, char_uuid, bytes(data))
 
     async def send_tts(self, opus_data: bytes):
         """Send Opus TTS data to ESP: start marker + data chunks + empty end."""
@@ -659,32 +664,34 @@ class HeliosClient:
             total_len = len(opus_data)
 
             # Start marker (mirrors mic→Pi Opus protocol)
-            header = b'\xFF\xFF\xFF\xFF'
-            await self.client.write_gatt_char(SPEAKER_RX_UUID, header, response=True)
+            await self._ble_write(SPEAKER_RX_UUID, b'\xFF\xFF\xFF\xFF')
 
-            # Data chunks — response=True guarantees delivery (no silent drops)
+            # Data chunks — helios_ble write is one ATT packet per call,
+            # so we chunk to MTU-3 (BLE_CHUNK_SIZE = 509) on the Python side.
             offset = 0
             chunks = 0
             while offset < total_len:
                 end = min(offset + BLE_CHUNK_SIZE, total_len)
-                chunk = opus_data[offset:end]
-                await self.client.write_gatt_char(SPEAKER_RX_UUID, chunk, response=True)
+                await self._ble_write(SPEAKER_RX_UUID, opus_data[offset:end])
                 offset = end
                 chunks += 1
 
             # Empty end marker
             await asyncio.sleep(0.02)
-            await self.client.write_gatt_char(SPEAKER_RX_UUID, b'', response=True)
+            await self._ble_write(SPEAKER_RX_UUID, b'')
             log.info(f"[TX] Sent {total_len:,} bytes Opus in {chunks} BLE chunks")
 
     async def cli_loop(self):
-        """Read CLI commands from stdin."""
+        """Read CLI commands from stdin. Skipped when running as systemd service."""
+        if not sys.stdin.isatty():
+            while True:  # Keep task alive but do nothing
+                await asyncio.sleep(3600)
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-        while self.client and self.client.is_connected:
+        while self.ble.is_connected():
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -700,16 +707,14 @@ class HeliosClient:
                     val = int(cmd.split()[1])
                     val = max(0, min(100, val))
                     async with self.ble_write_lock:
-                        await self.client.write_gatt_char(
-                            CONTROL_UUID, bytes([CMD_SET_VOLUME, val]), response=False)
+                        await self._ble_write(CONTROL_UUID, bytes([CMD_SET_VOLUME, val]))
                     print(f"  [SET] Volume -> {val}%")
                 except (ValueError, IndexError):
                     print("  Usage: vol <0-100>")
 
             elif cmd == "status":
                 async with self.ble_write_lock:
-                    await self.client.write_gatt_char(
-                        CONTROL_UUID, bytes([CMD_REQUEST_STATUS]), response=False)
+                    await self._ble_write(CONTROL_UUID, bytes([CMD_REQUEST_STATUS]))
 
             elif cmd == "clear":
                 turns = len([m for m in conversation["history"] if m["role"] == "user"])
@@ -728,7 +733,7 @@ class HeliosClient:
         cli_task = asyncio.create_task(self.cli_loop())
 
         try:
-            while self.client.is_connected:
+            while self.ble.is_connected():
                 self.query_event.clear()
                 try:
                     await asyncio.wait_for(self.query_event.wait(), timeout=1.0)
@@ -754,8 +759,7 @@ class HeliosClient:
 
                 # Signal processing
                 async with self.ble_write_lock:
-                    await self.client.write_gatt_char(
-                        CONTROL_UUID, bytes([CMD_PROCESSING]), response=False)
+                    await self._ble_write(CONTROL_UUID, bytes([CMD_PROCESSING]))
 
                 # Conversation timeout
                 if conversation["history"] and time.time() - conversation["last_time"] > CONVERSATION_TIMEOUT:
