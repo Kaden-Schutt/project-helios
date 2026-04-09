@@ -193,6 +193,47 @@ out of the box). Three ways:
 
 ---
 
+## Reaching the Pi from your MacBook
+
+`setup.sh` installs a three-layer reachability stack so you can SSH in
+no matter what network the Pi ends up on:
+
+| Layer | How it works | When it helps |
+|-------|-------------|---------------|
+| **mDNS / Avahi** | Pi advertises as `helios.local` on the LAN | Same WiFi network as your Mac |
+| **Tailscale** | Encrypted overlay network across NAT/firewalls | Class WiFi where you can't see the Pi directly, or different networks entirely |
+| **USB ethernet** | (Manual) `g_ether` gadget mode for last-resort | Pi has no working network at all |
+
+### Setting up Tailscale (one-time)
+
+1. Sign up at https://login.tailscale.com (free for personal)
+2. Generate an auth key: https://login.tailscale.com/admin/settings/keys
+   - Tag with `tag:helios`, set "Reusable" + "Ephemeral=no"
+3. Pass it to setup.sh:
+   ```bash
+   TAILSCALE_AUTHKEY=tskey-auth-... sudo bash scripts/setup.sh
+   ```
+4. After boot, the Pi shows up in your Tailscale admin panel as `helios`
+5. Install Tailscale on your Mac (one-time, https://tailscale.com/download/mac)
+6. SSH from anywhere: `ssh pi@helios` or `ssh pi@<tailscale-ip>`
+
+If you don't pass `TAILSCALE_AUTHKEY`, Tailscale gets installed but
+not authenticated. Run `sudo tailscale up` later to finish setup.
+
+### Quick connection tests from your Mac
+
+```bash
+# mDNS (same network)
+ssh pi@helios.local
+
+# Tailscale (any network, after setup)
+ssh pi@helios
+tailscale ping helios
+
+# Find IP via your phone hotspot's connected-devices list
+ssh pi@<ip-from-phone>
+```
+
 ## Troubleshooting
 
 **`setup.sh` fails at Rust/cargo stage**: out of RAM. The OrangePi Zero 2W

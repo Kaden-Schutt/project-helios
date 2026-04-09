@@ -111,8 +111,8 @@ source "$HELIOS_DIR/.venv/bin/activate"
 maturin develop --release
 EOF
 
-# --- 6. systemd services ---
-echo "[6/6] Installing systemd services..."
+# --- 6. systemd services + reachability ---
+echo "[6/6] Installing systemd services + reachability layer..."
 
 # WiFi import helper — reads /boot/firmware/wifi.conf at boot.
 # Lets you swap WiFi credentials by editing a FAT32 file from any OS.
@@ -120,6 +120,12 @@ if [[ -f "$HELIOS_DIR/scripts/helios-wifi-import.sh" ]]; then
     install -m 755 "$HELIOS_DIR/scripts/helios-wifi-import.sh" /usr/local/sbin/
     install -m 644 "$HELIOS_DIR/scripts/helios-wifi-import.service" /etc/systemd/system/
     systemctl enable helios-wifi-import.service
+fi
+
+# Reachability: avahi (mDNS), tailscale (cross-network), ssh always-on.
+# Pass TAILSCALE_AUTHKEY env var to auto-auth tailscale headlessly.
+if [[ -f "$HELIOS_DIR/scripts/helios-reachable.sh" ]]; then
+    bash "$HELIOS_DIR/scripts/helios-reachable.sh"
 fi
 
 cat > /etc/systemd/system/helios-ble.service <<EOF
