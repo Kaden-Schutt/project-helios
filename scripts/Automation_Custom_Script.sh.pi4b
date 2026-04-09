@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Helios first-boot install — Raspberry Pi 4B edition.
+#
+# Runs automatically after DietPi's base install on first boot.
+# By this point: network is up, apt packages installed (including bluez
+# since we put it in AUTO_SETUP_APT_INSTALLS), SSH running.
+#
+# Pi 4B uses the Broadcom BCM43455 WiFi+BT chip which is fully supported
+# in mainline Linux — no vendor drivers, no hciattach, bluez Just Works.
+# This is much simpler than the OrangePi Zero 2W setup.
+#
+# This script:
+#   1. Clones the Helios repo
+#   2. Creates a Python venv with all server deps
+#   3. Installs the PREBUILT helios_ble wheel (aarch64) from /boot
+#   4. Configures bluez ExchangeMTU = 517
+#   5. Installs helios-ble systemd unit (DISABLED by default — start manually)
+#
+# Logs: /var/tmp/dietpi/logs/dietpi-automation_custom_script.log
+
+set -euo pipefail
+
+HELIOS_REPO="https://github.com/Kaden-Schutt/project-helios.git"
+HELIOS_BRANCH="main"
+HELIOS_DIR="/root/project-helios"
+
+log() { echo "[helios-firstboot] $*"; }
+
+# --- 1. Make sure bluez is really there (belt and suspenders) ---
+if ! dpkg -l bluez 2>/dev/null | grep -q '^ii'; then
+    log "bluez not installed by AUTO_SETUP_APT_INSTALLS, installing now..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y bluez bluez-tools avahi-daemon avahi-utils
+fi
+
+# --- 2. Clone repo ---
+log "Cloning Helios repo..."
+if [[ ! -d "$HELIOS_DIR/.git" ]]; then
+    git clone --depth 1 --branch "$HELIOS_BRANCH" "$HELIOS_REPO" "$HELIOS_DIR"
+fi
+
+# --- 3. Python venv + deps ---
+log "Creating Python venv..."
+python3 -m venv "$HELIOS_DIR/.venv"
+"$HELIOS_DIR/.venv/bin/pip" install --upgrade pip wheel
+"$HELIOS_DIR/.venv/bin/pip" install \
+    opuslib httpx websockets python-dotenv \
+    anthropic numpy fastapi uvicorn
+
+# --- 4. Install helios_ble wheel ---
+log "Installing helios_ble wheel..."
+# DietPi copies the Automation script but not arbitrary files from DIETPISETUP.
+# Our prep-sd.sh copies the wheel to /boot via DietPi's staging mechanism.
+# Check multiple possible locations:
+WHEEL=""
+for loc in \
+    /boot/helios_ble-*.whl \
+    /boot/firmware/helios_ble-*.whl \
+    /root/helios_ble-*.whl \
+    /tmp/helios_ble-*.whl; do
+    if ls $loc >/dev/null 2>&1; then
+        WHEEL=$(ls $loc 2>/dev/null | head -1)
+        break
+    fi
+done
+
+if [[ -n "$WHEEL" && -f "$WHEEL" ]]; then
+    log "Found wheel at $WHEEL"
+    "$HELIOS_DIR/.venv/bin/pip" install --force-reinstall "$WHEEL"
+else
+    log "No prebuilt wheel found — building from source via maturin (SLOW)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y rustc cargo
+    "$HELIOS_DIR/.venv/bin/pip" install maturin
+    cd "$HELIOS_DIR/rust/helios_ble"
+    "$HELIOS_DIR/.venv/bin/maturin" develop --release
+    cd -
+fi
+
+# Verify
+log "Verifying helios_ble import..."
+if "$HELIOS_DIR/.venv/bin/python" -c "import helios_ble; print('helios_ble MIN_MTU =', helios_ble.MIN_MTU)"; then
+    log "helios_ble OK"
+else
+    log "WARNING: helios_ble import failed — server will not work until fixed"
+fi
+
+# --- 5. Configure bluez ATT MTU ---
+log "Configuring bluez ExchangeMTU = 517..."
+if [[ -f /etc/bluetooth/main.conf ]]; then
+    if grep -q "^#ExchangeMTU" /etc/bluetooth/main.conf; then
+        sed -i 's/^#ExchangeMTU.*/ExchangeMTU = 517/' /etc/bluetooth/main.conf
+    elif ! grep -q "^ExchangeMTU" /etc/bluetooth/main.conf; then
+        if grep -q "^\[GATT\]" /etc/bluetooth/main.conf; then
+            sed -i '/^\[GATT\]/a ExchangeMTU = 517' /etc/bluetooth/main.conf
+        else
+            printf "\n[GATT]\nExchangeMTU = 517\n" >> /etc/bluetooth/main.conf
+        fi
+    fi
+    systemctl restart bluetooth 2>&1 || true
+fi
+
+# --- 6. helios-ble systemd unit (disabled by default) ---
+log "Installing helios-ble.service (DISABLED)..."
+cat > /etc/systemd/system/helios-ble.service <<EOF
+[Unit]
+Description=Helios BLE Voice + Vision Server
+After=bluetooth.service network-online.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$HELIOS_DIR
+ExecStart=$HELIOS_DIR/.venv/bin/python server_ble.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+# NOT enabled — start manually after placing .env:
+#   scp .env root@helios.local:/root/project-helios/.env
+#   systemctl start helios-ble
+
+log "======================================"
+log "Helios first-boot install complete"
+log "======================================"
+log ""
+log "Next steps:"
+log "  1. scp .env root@helios.local:/root/project-helios/.env"
+log "  2. systemctl start helios-ble"
+log "  3. journalctl -u helios-ble -f"
+log ""
+log "Pi reachable as helios.local on whatever WiFi it joined."
