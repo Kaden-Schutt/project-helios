@@ -40,7 +40,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import settings       # local module — see settings.py
-import wake_stream    # local module — see wake_stream.py
 
 # ---------------------------------------------------------------------------
 # Config
@@ -573,24 +572,6 @@ def _publish_tts(pcm_s16le: bytes, text: str):
 bt_sink_name = os.getenv("HELIOS_BT_SINK", "bluez_output.41_42_40_3A_47_17.1")
 
 
-def _make_earcon_pcm(duration_s: float = 0.15, freq_hz: float = 880.0) -> bytes:
-    """Short beep at TTS_SAMPLE_RATE with a gentle attack/release. Played on
-    wake-word detection so the user knows the device heard them."""
-    sr = TTS_SAMPLE_RATE
-    n = int(sr * duration_s)
-    t = np.arange(n) / sr
-    tone = np.sin(2 * np.pi * freq_hz * t) * 8000
-    env = np.ones(n, dtype=np.float64)
-    fade = max(1, int(sr * 0.015))
-    if fade * 2 < n:
-        env[:fade] = np.linspace(0.0, 1.0, fade)
-        env[-fade:] = np.linspace(1.0, 0.0, fade)
-    return (tone * env).astype(np.int16).tobytes()
-
-
-_EARCON_PCM = _make_earcon_pcm()
-
-
 def _scale_pcm_volume(pcm_s16le: bytes, pct: int) -> bytes:
     """Attenuate s16le PCM by pct (0..100) before playback. Done in software so
     we're sink-agnostic (works on macOS dev without pactl, on Pi without PulseAudio
@@ -727,129 +708,24 @@ async def _pendant_gesture_poller():
 
 
 # ---------------------------------------------------------------------------
-# Wake-stream — always-on mic → STT → wake detection → pipeline
-# ---------------------------------------------------------------------------
-_wake_stream: wake_stream.WakeStream | None = None
-
-
-async def _on_wake_triggered():
-    """Earcon + optional haptic on wake. Runs before capture completes."""
-    asyncio.create_task(_play_on_bt(_EARCON_PCM))
-
-
-async def _fetch_pendant_frame() -> str:
-    """Pull the pendant's most recent JPEG via /frame. Returns base64 or ''."""
-    if not PENDANT_BASE_URL:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{PENDANT_BASE_URL}/frame")
-            if r.status_code == 200 and r.content[:2] == b"\xff\xd8":
-                resized = resize_jpeg_for_llm(r.content, max_side=512)
-                log.info(f"[WAKE] fetched /frame: {len(r.content):,}B raw, {len(resized):,}B resized")
-                return base64.b64encode(resized).decode()
-    except Exception as e:
-        log.warning(f"[WAKE] /frame fetch failed: {e}")
-    return ""
-
-
-async def _on_wake_query(text: str):
-    """Completed-capture handler — route through the same mode-aware path as
-    /query. TTS plays via Pi BT sink; pendant is not a participant in playback."""
-    # Prefer the freshest JPEG we have in device_state (e.g. from /photo/upload);
-    # otherwise pull it live from the pendant's /frame endpoint.
-    image_b64 = device_state.get("jpeg_b64") or ""
-    device_state["jpeg_b64"] = None
-    if not image_b64:
-        image_b64 = await _fetch_pendant_frame()
-
-    if mode_state["mode"] == "query" and _is_settings_entry(text):
-        _enter_settings_mode()
-        response_text = "Settings mode."
-    elif mode_state["mode"] == "settings":
-        response_text = await settings_query(text)
-    else:
-        keep_history = settings.get("conversation_memory")
-        check_conversation_timeout()
-        history = conversation["history"] if keep_history else []
-        response_text = await vision_query(text, image_b64, history)
-        if keep_history:
-            conversation["history"].append({"role": "user", "content": text})
-            conversation["history"].append({"role": "assistant", "content": response_text})
-            conversation["last_query_time"] = time.time()
-
-    # Synthesize and play via BT. Also publish to mirror for Mac-bypass dev path.
-    pcm = await tts_synthesize(response_text)
-    _publish_tts(pcm, response_text)
-
-    # Suppress self-wake while TTS is audible on the MT speaker (which the
-    # pendant mic picks up). Duration ≈ PCM length + tail.
-    tts_dur = len(pcm) / 2 / TTS_SAMPLE_RATE
-    if _wake_stream:
-        _wake_stream.suppress_for(tts_dur + wake_stream.TTS_TAIL_S)
-
-
-def _wake_enabled() -> bool:
-    """Gate the wake detector on settings.wake_enabled / privacy_mute / sleep_mode."""
-    return (
-        settings.get("wake_enabled")
-        and not settings.get("privacy_mute")
-        and not settings.get("sleep_mode")
-    )
-
-
-async def _wake_ticker():
-    """Drives WakeStream.tick() every 100ms so VAD silence timeouts fire even
-    when Cartesia is briefly quiet."""
-    while True:
-        try:
-            if _wake_stream:
-                await _wake_stream.tick()
-        except Exception as e:
-            log.error(f"[WAKE-TICK] {e}")
-        await asyncio.sleep(0.1)
-
-
-# ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _wake_stream
-
-    # Pendant gesture poller
+    # Pendant gesture poller — lets triple-tap etc. flip modes without voice
     poller_task = None
     if PENDANT_BASE_URL:
         log.info(f"[PENDANT] poller → {PENDANT_BASE_URL} every {PENDANT_POLL_S*1000:.0f}ms")
         poller_task = asyncio.create_task(_pendant_gesture_poller())
-
-    # Wake stream — started lazily on first /ws/stream connect so we don't burn
-    # STT time when no pendant is connected. Pre-create the object so callbacks
-    # can reference it and the ticker can poll it.
-    if CARTESIA_API_KEY:
-        _wake_stream = wake_stream.WakeStream(
-            api_key=CARTESIA_API_KEY,
-            on_query=_on_wake_query,
-            on_wake=_on_wake_triggered,
-            is_enabled=_wake_enabled,
-        )
-    else:
-        log.warning("[WAKE] no CARTESIA_API_KEY — always-on streaming disabled")
-
-    ticker_task = asyncio.create_task(_wake_ticker())
-
     try:
         yield
     finally:
-        for t in (poller_task, ticker_task):
-            if t:
-                t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
-        if _wake_stream:
-            await _wake_stream.stop()
+        if poller_task:
+            poller_task.cancel()
+            try:
+                await poller_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(title="Helios Relay Server", lifespan=_lifespan)
@@ -1122,36 +998,6 @@ async def handle_query(request: Request):
             "X-Encoding": TTS_ENCODING,
         },
     )
-
-
-# ---------------------------------------------------------------------------
-# Always-on streaming endpoint (wake-word path — pendant holds this open
-# and pushes PCM continuously). Distinct from /ws which is the legacy
-# button-triggered single-turn path.
-# ---------------------------------------------------------------------------
-@app.websocket("/ws/stream")
-async def ws_stream(ws: WebSocket):
-    await ws.accept()
-    if not _wake_stream:
-        log.warning("[WS-STREAM] client connected but wake_stream is disabled")
-        await ws.close()
-        return
-
-    await _wake_stream.start()
-    log.info("[WS-STREAM] pendant connected — feeding STT")
-    try:
-        while True:
-            msg = await ws.receive()
-            if "bytes" in msg:
-                await _wake_stream.feed(msg["bytes"])
-            elif "text" in msg:
-                # Reserved for future control messages (mute, resync, etc.)
-                t = msg["text"]
-                log.info(f"[WS-STREAM] control: {t!r}")
-    except WebSocketDisconnect:
-        log.info("[WS-STREAM] pendant disconnected")
-    except Exception as e:
-        log.error(f"[WS-STREAM] {e}")
 
 
 # ---------------------------------------------------------------------------
