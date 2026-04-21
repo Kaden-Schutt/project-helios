@@ -594,10 +594,38 @@ async def _play_on_bt(pcm_bytes: bytes):
     except Exception as e:
         log.error(f"[BT-PLAY] {e}")
 
+
+def _apply_bt_volume(pct: int) -> None:
+    """Set the BT sink volume via pactl. Fire-and-forget; silent if pactl is absent."""
+    pct = max(0, min(100, int(pct)))
+    sink = bt_sink_name or "@DEFAULT_SINK@"
+    try:
+        import subprocess
+        subprocess.Popen(
+            ["pactl", "set-sink-volume", sink, f"{pct}%"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        log.info(f"[VOLUME] pactl {sink} -> {pct}%")
+    except FileNotFoundError:
+        log.debug("[VOLUME] pactl not installed — skipping (dev machine?)")
+    except Exception as e:
+        log.warning(f"[VOLUME] pactl failed: {e}")
+
+
+settings.on_change("volume", _apply_bt_volume)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Helios Relay Server")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Apply current volume to BT sink at boot so pactl reflects settings.json.
+    _apply_bt_volume(settings.get("volume"))
+    yield
+
+
+app = FastAPI(title="Helios Relay Server", lifespan=_lifespan)
 
 
 @app.get("/health")
@@ -921,17 +949,29 @@ async def ws_query(ws: WebSocket):
         transcript = " ".join(stt_parts)
         stt_time = time.time() - total_t0
         if not transcript:
-            transcript = "What do you see?" if jpeg_b64 else "Hello"
+            if mode_state["mode"] == "settings":
+                transcript = "done"
+            else:
+                transcript = "What do you see?" if jpeg_b64 else "Hello"
             log.warning(f"[WS] Empty STT, fallback: \"{transcript}\"")
         else:
             log.info(f"[WS] STT ({stt_time:.1f}s): \"{transcript}\"")
 
-        # --- LLM ---
-        check_conversation_timeout()
-        response_text = await vision_query(transcript, jpeg_b64, conversation["history"])
-        conversation["history"].append({"role": "user", "content": transcript})
-        conversation["history"].append({"role": "assistant", "content": response_text})
-        conversation["last_query_time"] = time.time()
+        # --- Mode detection + LLM dispatch ---
+        if mode_state["mode"] == "query" and _is_settings_entry(transcript):
+            _enter_settings_mode()
+            response_text = "Settings mode."
+        elif mode_state["mode"] == "settings":
+            response_text = await settings_query(transcript)
+        else:
+            keep_history = settings.get("conversation_memory")
+            check_conversation_timeout()
+            history = conversation["history"] if keep_history else []
+            response_text = await vision_query(transcript, jpeg_b64, history)
+            if keep_history:
+                conversation["history"].append({"role": "user", "content": transcript})
+                conversation["history"].append({"role": "assistant", "content": response_text})
+                conversation["last_query_time"] = time.time()
         log.info(f"[WS] LLM: \"{response_text[:80]}\"")
 
         # --- Stream TTS back to ESP ---
