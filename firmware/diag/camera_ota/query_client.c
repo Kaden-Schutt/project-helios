@@ -92,12 +92,24 @@ static void query_task(void *arg)
 
         size_t offset = 0;
         size_t underruns = 0;
+        esp_err_t last_err = ESP_OK;
+        size_t last_got = 99999;
         while (button_is_holding() && offset + CHUNK_BYTES <= max_bytes) {
             size_t got = 0;
             esp_err_t err = mic_helios_read(rec + offset, CHUNK_BYTES, &got, 200);
-            if (err != ESP_OK || got == 0) { underruns++; continue; }
+            if (err != ESP_OK || got == 0) {
+                if (underruns < 3) {
+                    DLOG("[QUERY] mic_read err=0x%x got=%u (underrun #%u)\n",
+                         err, (unsigned)got, (unsigned)(underruns + 1));
+                }
+                underruns++;
+                last_err = err;
+                last_got = got;
+                continue;
+            }
             offset += got;
         }
+        (void)last_err; (void)last_got;
         mic_probe_resume();
 
         int64_t t1 = esp_timer_get_time();
