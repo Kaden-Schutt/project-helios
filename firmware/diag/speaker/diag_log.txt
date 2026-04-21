@@ -1,0 +1,130 @@
+[  0.00s] ESP-ROM:esp32s3-20210327
+[  0.00s] Build:Mar 27 2021
+[  0.00s] rst:0x15 (USB_UART_CHIP_RESET),boot:0x28 (SPI_FAST_FLASH_BOOT)
+[  0.00s] Saved PC:0x40377e46
+[  0.00s] SPIWP:0xee
+[  0.00s] mode:DIO, clock div:1
+[  0.00s] load:0x3fce2820,len:0x16a4
+[  0.00s] load:0x403c8700,len:0xe80
+[  0.00s] load:0x403cb700,len:0x3188
+[  0.00s] entry 0x403c8940
+[  0.00s] I (24) boot: ESP-IDF 5.5.3 2nd stage bootloader
+[  0.00s] I (24) boot: compile time Apr 19 2026 15:25:02
+[  0.00s] I (25) boot: Multicore bootloader
+[  0.00s] I (25) boot: chip revision: v0.2
+[  0.00s] I (25) boot: efuse block revision: v1.3
+[  0.00s] I (25) qio_mode: Enabling default flash chip QIO
+[  0.00s] I (26) boot.esp32s3: Boot SPI Speed : 80MHz
+[  0.00s] I (26) boot.esp32s3: SPI Mode       : QIO
+[  0.00s] I (26) boot.esp32s3: SPI Flash Size : 8MB
+[  0.00s] I (26) boot: Enabling RNG early entropy source...
+[  0.00s] I (26) boot: Partition Table:
+[  0.00s] I (26) boot: ## Label            Usage          Type ST Offset   Length
+[  0.00s] I (27) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+[  0.00s] I (27) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+[  0.00s] I (28) boot:  2 factory          factory app      00 00 00010000 00100000
+[  0.00s] I (28) boot: End of partition table
+[  0.00s] I (28) esp_image: segment 0: paddr=00010020 vaddr=3c020020 size=0bfc4h ( 49092) map
+[  0.00s] I (36) esp_image: segment 1: paddr=0001bfec vaddr=3fc93e00 size=0330ch ( 13068) load
+[  0.00s] I (39) esp_image: segment 2: paddr=0001f300 vaddr=40374000 size=00d18h (  3352) load
+[  0.00s] I (40) esp_image: segment 3: paddr=00020020 vaddr=42000020 size=1b6e8h (112360) map
+[  0.00s] I (57) esp_image: segment 4: paddr=0003b710 vaddr=40374d18 size=0f098h ( 61592) load
+[  0.00s] I (69) esp_image: segment 5: paddr=0004a7b0 vaddr=50000000 size=00020h (    32) load
+[  0.00s] I (76) boot: Loaded app from partition at offset 0x10000
+[  0.00s] I (76) boot: Disabling RNG early entropy source...
+[  0.00s] I (77) octal_psram: vendor id    : 0x0d (AP)
+[  0.00s] I (77) octal_psram: dev id       : 0x02 (generation 3)
+[  0.00s] I (77) octal_psram: density      : 0x03 (64 Mbit)
+[  0.00s] I (77) octal_psram: good-die     : 0x01 (Pass)
+[  0.00s] I (77) octal_psram: Latency      : 0x01 (Fixed)
+[  0.00s] I (78) octal_psram: VCC          : 0x01 (3V)
+[  0.00s] I (78) octal_psram: SRF          : 0x01 (Fast Refresh)
+[  0.00s] I (78) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+[  0.00s] I (78) octal_psram: BurstLen     : 0x01 (32 Byte)
+[  0.00s] I (78) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+[  0.01s] I (79) octal_psram: DriveStrength: 0x00 (1/1)
+[  0.01s] I (79) MSPI Timing: Enter psram timing tuning
+[  0.01s] I (80) esp_psram: Found 8MB PSRAM device
+[  0.01s] I (80) esp_psram: Speed: 80MHz
+[  0.01s] I (80) cpu_start: Multicore app
+[  0.31s] I (513) esp_psram: SPI SRAM memory test OK
+[  0.32s] I (522) cpu_start: Pro cpu start user code
+[  0.32s] I (522) cpu_start: cpu freq: 160000000 Hz
+[  0.32s] I (522) app_init: Application information:
+[  0.32s] I (522) app_init: Project name:     helios_wifi_test
+[  0.32s] I (522) app_init: App version:      b833fde-dirty
+[  0.32s] I (522) app_init: Compile time:     Apr 19 2026 15:24:53
+[  0.32s] I (522) app_init: ELF file SHA256:  bcdd5aa7d...
+[  0.32s] I (523) app_init: ESP-IDF:          5.5.3
+[  0.32s] I (523) efuse_init: Min chip rev:     v0.0
+[  0.32s] I (523) efuse_init: Max chip rev:     v0.99 
+[  0.32s] I (523) efuse_init: Chip rev:         v0.2
+[  0.32s] I (523) heap_init: Initializing. RAM available for dynamic allocation:
+[  0.32s] I (524) heap_init: At 3FC97A40 len 00051CD0 (327 KiB): RAM
+[  0.32s] I (524) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+[  0.32s] I (524) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+[  0.32s] I (524) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+[  0.32s] I (524) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+[  0.32s] I (525) spi_flash: detected chip: gd
+[  0.32s] I (525) spi_flash: flash io: qio
+[  0.32s] I (526) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+[  0.32s] I (526) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+[  0.32s] I (527) main_task: Started on CPU0
+[  0.33s] I (537) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+[  0.33s] I (537) main_task: Calling app_main()
+[  0.92s] [SPKDIAG] ================================================
+[  0.92s] [SPKDIAG] Helios Speaker Diagnostic
+[  0.93s] [SPKDIAG] ================================================
+[  0.93s] [SPKDIAG] chip=ESP32-S3 cores=2 rev=2 flash=8 MB
+[  0.93s] [SPKDIAG] reset_reason=11 (unknown)
+[  0.93s] [SPKDIAG] heap_default=8721820 internal=367659 psram=8386192
+[  0.93s] [SPKDIAG] heap_largest_internal=270336 largest_psram=8257536
+[  0.93s] [SPKDIAG] pins LRC=5 BCLK=6 DIN=43  sample_rate=24000 mono I2S1
+[  0.93s] [SPKDIAG] HW NOTE: MAX98357A SD_MODE must be tied to VCC; GAIN_SLOT to GND for 12dB gain. Not readable from ESP.
+[  0.93s] I (1137) spk: ready: LRC=5 BCLK=6 DIN=43 @ 24000 Hz, vol=50%
+[  0.93s] [SPKDIAG] speaker_pcm_init err=0x0
+[  0.93s] [SPKDIAG] ---- T1 SILENCE 2s ----
+[  0.93s] I (1137) spk: volume: 50%
+[  3.34s] [SPKDIAG] T1_SILENCE_2s: err=0x0 vol=50% bytes=96000 took_us=2404472 expected=2000000 drift=20.22% heap=350775
+[  3.34s] [SPKDIAG] ---- T2 1 kHz @ 25% vol ----
+[  4.01s] I (4217) spk: volume: 50%
+[  6.42s] [SPKDIAG] T2_1KHZ_25pct: err=0x0 vol=50% bytes=96000 took_us=2401295 expected=2000000 drift=20.06% heap=350555
+[  6.42s] [SPKDIAG] ---- T3 1 kHz @ 75% vol ----
+[  7.09s] I (7297) spk: volume: 50%
+[  9.50s] [SPKDIAG] T3_1KHZ_75pct: err=0x0 vol=50% bytes=96000 took_us=2401535 expected=2000000 drift=20.08% heap=350555
+[  9.50s] [SPKDIAG] ---- T4 SWEEP ----
+[ 10.03s] I (10237) spk: volume: 50%
+[ 11.98s] [SPKDIAG] T4_SWEEP_100Hz: err=0x0 vol=50% bytes=72000 took_us=1940760 expected=1500000 drift=29.38% heap=350555
+[ 12.51s] I (12717) spk: volume: 50%
+[ 14.45s] [SPKDIAG] T4_SWEEP_250Hz: err=0x0 vol=50% bytes=72000 took_us=1937879 expected=1500000 drift=29.19% heap=350555
+[ 14.97s] I (15177) spk: volume: 50%
+[ 16.91s] [SPKDIAG] T4_SWEEP_500Hz: err=0x0 vol=50% bytes=72000 took_us=1933264 expected=1500000 drift=28.88% heap=350555
+[ 17.41s] I (17617) spk: volume: 50%
+[ 19.36s] [SPKDIAG] T4_SWEEP_1000Hz: err=0x0 vol=50% bytes=72000 took_us=1940958 expected=1500000 drift=29.40% heap=350555
+[ 19.81s] I (20017) spk: volume: 50%
+[ 21.75s] [SPKDIAG] T4_SWEEP_2000Hz: err=0x0 vol=50% bytes=72000 took_us=1934882 expected=1500000 drift=28.99% heap=350555
+[ 22.26s] I (22467) spk: volume: 50%
+[ 24.19s] [SPKDIAG] T4_SWEEP_4000Hz: err=0x0 vol=50% bytes=72000 took_us=1935191 expected=1500000 drift=29.01% heap=350555
+[ 24.71s] I (24917) spk: volume: 50%
+[ 26.65s] [SPKDIAG] T4_SWEEP_8000Hz: err=0x0 vol=50% bytes=72000 took_us=1941389 expected=1500000 drift=29.43% heap=350555
+[ 26.65s] [SPKDIAG] ---- T5 AMPLITUDE RAMP 0->100% @ 1 kHz, 6s ----
+[ 28.75s] I (28957) spk: volume: 80%
+[ 35.16s] [SPKDIAG] T5_AMP_RAMP: err=0x0 vol=80% bytes=288000 took_us=6414503 expected=6000000 drift=6.91% heap=350555
+[ 35.16s] [SPKDIAG] ---- T6 NOISE 50% ----
+[ 35.17s] I (35377) spk: volume: 50%
+[ 37.58s] [SPKDIAG] T6_NOISE_50pct: err=0x0 vol=50% bytes=96000 took_us=2403206 expected=2000000 drift=20.16% heap=350555
+[ 37.58s] [SPKDIAG] ---- T7 BROWNOUT STRESS: 5x 200ms bursts @ 100% ----
+[ 37.58s] I (37787) spk: volume: 100%
+[ 38.26s] [SPKDIAG] T7 pulse_0: err=0x0 took_us=616964 heap=350555
+[ 39.15s] [SPKDIAG] T7 pulse_1: err=0x0 took_us=617709 heap=350555
+[ 40.04s] [SPKDIAG] T7 pulse_2: err=0x0 took_us=617707 heap=350555
+[ 40.93s] [SPKDIAG] T7 pulse_3: err=0x0 took_us=617709 heap=350555
+[ 41.82s] [SPKDIAG] T7 pulse_4: err=0x0 took_us=617707 heap=350555
+[ 42.02s] [SPKDIAG] ---- T8 THROUGHPUT 10s @ 1kHz 50% ----
+[ 45.41s] I (45617) spk: volume: 50%
+[ 55.84s] [SPKDIAG] T8_THROUGHPUT: err=0x0 bytes=480000 took_us=10430249 expected=10000000 drift=4.30%
+[ 55.85s] [SPKDIAG] ---- T9 FINAL STATE ----
+[ 55.85s] [SPKDIAG] reset_reason_post=11 (unknown)
+[ 55.85s] [SPKDIAG] heap_post internal=350555 psram=8385632
+[ 55.85s] [SPKDIAG] ================ DIAG DONE ================
+[ 55.85s] [SPKDIAG] (idle loop — reboot ESP to rerun)

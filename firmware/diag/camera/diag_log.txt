@@ -1,0 +1,134 @@
+[  0.00s] ESP-ROM:esp32s3-20210327
+[  0.00s] Build:Mar 27 2021
+[  0.00s] rst:0x15 (USB_UART_CHIP_RESET),boot:0x28 (SPI_FAST_FLASH_BOOT)
+[  0.00s] Saved PC:0x40377d2a
+[  0.00s] SPIWP:0xee
+[  0.00s] mode:DIO, clock div:1
+[  0.00s] load:0x3fce2820,len:0x16a4
+[  0.00s] load:0x403c8700,len:0xe80
+[  0.00s] load:0x403cb700,len:0x3188
+[  0.00s] entry 0x403c8940
+[  0.00s] I (24) boot: ESP-IDF 5.5.3 2nd stage bootloader
+[  0.00s] I (24) boot: compile time Apr 19 2026 15:25:02
+[  0.00s] I (25) boot: Multicore bootloader
+[  0.00s] I (25) boot: chip revision: v0.2
+[  0.00s] I (25) boot: efuse block revision: v1.3
+[  0.00s] I (25) qio_mode: Enabling default flash chip QIO
+[  0.00s] I (26) boot.esp32s3: Boot SPI Speed : 80MHz
+[  0.00s] I (26) boot.esp32s3: SPI Mode       : QIO
+[  0.00s] I (26) boot.esp32s3: SPI Flash Size : 8MB
+[  0.00s] I (26) boot: Enabling RNG early entropy source...
+[  0.00s] I (26) boot: Partition Table:
+[  0.00s] I (26) boot: ## Label            Usage          Type ST Offset   Length
+[  0.00s] I (27) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+[  0.00s] I (27) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+[  0.00s] I (28) boot:  2 factory          factory app      00 00 00010000 00100000
+[  0.00s] I (28) boot: End of partition table
+[  0.00s] I (28) esp_image: segment 0: paddr=00010020 vaddr=3c030020 size=0f534h ( 62772) map
+[  0.00s] I (38) esp_image: segment 1: paddr=0001f55c vaddr=3fc92900 size=00abch (  2748) load
+[  0.00s] I (39) esp_image: segment 2: paddr=00020020 vaddr=42000020 size=22b70h (142192) map
+[  0.00s] I (61) esp_image: segment 3: paddr=00042b98 vaddr=3fc933bc size=04d98h ( 19864) load
+[  0.00s] I (64) esp_image: segment 4: paddr=00047938 vaddr=40374000 size=0e84ch ( 59468) load
+[  0.00s] I (76) esp_image: segment 5: paddr=0005618c vaddr=50000000 size=00020h (    32) load
+[  0.00s] I (83) boot: Loaded app from partition at offset 0x10000
+[  0.00s] I (83) boot: Disabling RNG early entropy source...
+[  0.00s] I (84) octal_psram: vendor id    : 0x0d (AP)
+[  0.00s] I (84) octal_psram: dev id       : 0x02 (generation 3)
+[  0.00s] I (84) octal_psram: density      : 0x03 (64 Mbit)
+[  0.00s] I (84) octal_psram: good-die     : 0x01 (Pass)
+[  0.00s] I (84) octal_psram: Latency      : 0x01 (Fixed)
+[  0.00s] I (85) octal_psram: VCC          : 0x01 (3V)
+[  0.00s] I (85) octal_psram: SRF          : 0x01 (Fast Refresh)
+[  0.00s] I (85) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+[  0.00s] I (85) octal_psram: BurstLen     : 0x01 (32 Byte)
+[  0.00s] I (86) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+[  0.01s] I (86) octal_psram: DriveStrength: 0x00 (1/1)
+[  0.01s] I (86) MSPI Timing: Enter psram timing tuning
+[  0.01s] I (87) esp_psram: Found 8MB PSRAM device
+[  0.01s] I (87) esp_psram: Speed: 80MHz
+[  0.01s] I (87) cpu_start: Multicore app
+[  0.30s] I (510) esp_psram: SPI SRAM memory test OK
+[  0.31s] I (519) cpu_start: Pro cpu start user code
+[  0.31s] I (519) cpu_start: cpu freq: 160000000 Hz
+[  0.31s] I (519) app_init: Application information:
+[  0.31s] I (519) app_init: Project name:     helios_wifi_test
+[  0.31s] I (519) app_init: App version:      b833fde-dirty
+[  0.31s] I (519) app_init: Compile time:     Apr 19 2026 15:29:33
+[  0.31s] I (519) app_init: ELF file SHA256:  c13aa0a79...
+[  0.31s] I (520) app_init: ESP-IDF:          5.5.3
+[  0.31s] I (520) efuse_init: Min chip rev:     v0.0
+[  0.31s] I (520) efuse_init: Max chip rev:     v0.99 
+[  0.31s] I (520) efuse_init: Chip rev:         v0.2
+[  0.31s] I (520) heap_init: Initializing. RAM available for dynamic allocation:
+[  0.31s] I (521) heap_init: At 3FC99330 len 000503E0 (320 KiB): RAM
+[  0.31s] I (521) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+[  0.31s] I (521) heap_init: At 3FCF0000 len 00008000 (32 KiB): DRAM
+[  0.31s] I (521) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+[  0.31s] I (521) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+[  0.31s] I (522) spi_flash: detected chip: gd
+[  0.31s] I (522) spi_flash: flash io: qio
+[  0.31s] I (523) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+[  0.31s] I (523) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+[  0.31s] I (524) main_task: Started on CPU0
+[  0.32s] I (534) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+[  0.32s] I (534) main_task: Calling app_main()
+[  0.92s] [CAMDIAG] ================================================
+[  0.92s] [CAMDIAG] Helios Camera Diagnostic
+[  0.92s] [CAMDIAG] ================================================
+[  0.92s] [CAMDIAG] chip=ESP32-S3 cores=2 rev=2 flash=8 MB
+[  0.92s] [CAMDIAG] reset_reason=11 (unknown)
+[  0.92s] [CAMDIAG] heap_default=8715436 internal=361275 psram=8386192
+[  0.92s] [CAMDIAG] heap_largest_internal=262144 largest_psram=8257536
+[  0.92s] [CAMDIAG] cam pins: XCLK=10 SIOD=40 SIOC=39 D0..D7=15,17,18,16,14,12,11,48 VSYNC=38 HREF=47 PCLK=13
+[  0.92s] [CAMDIAG] ---- PHASE 0: SCCB I2C BUS SCAN ----
+[  0.92s] [CAMDIAG] I2C_SCAN init err=0x0 (SDA=40 SCL=39, pullup=on)
+[  0.94s] [CAMDIAG] I2C_SCAN RESULT: NO devices on SCCB bus — camera ribbon is not connected, ribbon is damaged, or sensor has failed. Check physical connection.
+[  0.94s] I (1154) s3 ll_cam: DMA Channel=0
+[  0.94s] I (1154) cam_hal: cam init ok
+[  0.94s] I (1154) sccb-ng: pin_sda 40 pin_scl 39
+[  0.94s] I (1154) sccb-ng: sccb_i2c_port=1
+[  0.95s] E (1164) camera: Detected camera not supported.
+[  0.95s] E (1164) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[  0.95s] E (1164) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[  0.95s] [CAMDIAG] camera_init: err=0x106 took_us=13415 ready=0
+[  0.95s] [CAMDIAG] FATAL: init failed. Retrying every 5s (max 10).
+[  5.95s] I (6164) s3 ll_cam: DMA Channel=0
+[  5.95s] I (6164) cam_hal: cam init ok
+[  5.95s] I (6164) sccb-ng: pin_sda 40 pin_scl 39
+[  5.95s] I (6164) sccb-ng: sccb_i2c_port=1
+[  5.96s] E (6174) camera: Detected camera not supported.
+[  5.96s] E (6174) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[  5.96s] E (6174) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[  5.96s] [CAMDIAG] retry 0: err=0x106 ready=0
+[ 10.96s] I (11174) s3 ll_cam: DMA Channel=0
+[ 10.96s] I (11174) cam_hal: cam init ok
+[ 10.96s] I (11174) sccb-ng: pin_sda 40 pin_scl 39
+[ 10.96s] I (11174) sccb-ng: sccb_i2c_port=1
+[ 10.97s] E (11184) camera: Detected camera not supported.
+[ 10.97s] E (11184) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[ 10.97s] E (11184) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[ 10.97s] [CAMDIAG] retry 1: err=0x106 ready=0
+[ 15.97s] I (16184) s3 ll_cam: DMA Channel=0
+[ 15.97s] I (16184) cam_hal: cam init ok
+[ 15.97s] I (16184) sccb-ng: pin_sda 40 pin_scl 39
+[ 15.97s] I (16184) sccb-ng: sccb_i2c_port=1
+[ 15.98s] E (16194) camera: Detected camera not supported.
+[ 15.98s] E (16194) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[ 15.98s] E (16194) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[ 15.98s] [CAMDIAG] retry 2: err=0x106 ready=0
+[ 20.98s] I (21194) s3 ll_cam: DMA Channel=0
+[ 20.98s] I (21194) cam_hal: cam init ok
+[ 20.98s] I (21194) sccb-ng: pin_sda 40 pin_scl 39
+[ 20.98s] I (21194) sccb-ng: sccb_i2c_port=1
+[ 20.99s] E (21204) camera: Detected camera not supported.
+[ 20.99s] E (21204) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[ 20.99s] E (21204) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[ 20.99s] [CAMDIAG] retry 3: err=0x106 ready=0
+[ 25.99s] I (26204) s3 ll_cam: DMA Channel=0
+[ 25.99s] I (26204) cam_hal: cam init ok
+[ 25.99s] I (26204) sccb-ng: pin_sda 40 pin_scl 39
+[ 25.99s] I (26204) sccb-ng: sccb_i2c_port=1
+[ 26.00s] E (26214) camera: Detected camera not supported.
+[ 26.00s] E (26214) camera: Camera probe failed with error 0x106(ESP_ERR_NOT_SUPPORTED)
+[ 26.00s] E (26214) cam: init failed: 0x106 (ESP_ERR_NOT_SUPPORTED)
+[ 26.00s] [CAMDIAG] retry 4: err=0x106 ready=0

@@ -12,3 +12,15 @@ firmware/CMakeLists.txt
 output/
 .DS_Store
 scripts/wifi.conf
+firmware/include/wifi_credentials.h
+
+# Signed OTA artifacts and embedded HMAC key (generated per-dev-machine)
+firmware/diag/*/ota_pubkey.h
+firmware/diag/*/wifi_credentials.h
+firmware/diag/**/.pio/
+firmware/diag/**/managed_components/
+firmware/diag/**/dependencies.lock
+firmware/diag/**/sdkconfig.xiao_esp32s3*
+firmware/diag/**/build/
+*.pcm
+firmware/diag/speaker/tts_clips.h
