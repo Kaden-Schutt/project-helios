@@ -26,6 +26,8 @@ import io
 import uuid
 import wave
 
+import numpy as np
+
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
@@ -502,11 +504,11 @@ async def tts_synthesize(text: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Device state (JPEG from /photo/upload, volume config)
+# Device state — last uploaded JPEG (consumed by next /query). Volume moved
+# to settings.volume; there's only one source of truth now.
 # ---------------------------------------------------------------------------
 device_state = {
-    "jpeg_b64": None,    # last uploaded JPEG, consumed by next /query
-    "volume": 30,        # TTS playback volume, 0-100
+    "jpeg_b64": None,
 }
 
 
@@ -570,10 +572,27 @@ def _publish_tts(pcm_s16le: bytes, text: str):
 bt_sink_name = os.getenv("HELIOS_BT_SINK", "bluez_output.41_42_40_3A_47_17.1")
 
 
+def _scale_pcm_volume(pcm_s16le: bytes, pct: int) -> bytes:
+    """Attenuate s16le PCM by pct (0..100) before playback. Done in software so
+    we're sink-agnostic (works on macOS dev without pactl, on Pi without PulseAudio
+    config). pct >= 100 passes through unchanged; pct <= 0 yields silence."""
+    if pct >= 100:
+        return pcm_s16le
+    if pct <= 0:
+        return b"\x00" * len(pcm_s16le)
+    if not pcm_s16le:
+        return pcm_s16le
+    arr = np.frombuffer(pcm_s16le, dtype=np.int16).astype(np.int32)
+    arr = (arr * int(pct)) // 100
+    return arr.astype(np.int16).tobytes()
+
+
 async def _play_on_bt(pcm_bytes: bytes):
-    """Pipe raw PCM into paplay on the Pi. Runs fully in the background."""
+    """Pipe raw PCM into paplay on the Pi. Runs fully in the background.
+    Volume is applied in software from settings.volume before playback."""
     if not pcm_bytes:
         return
+    pcm_bytes = _scale_pcm_volume(pcm_bytes, settings.get("volume"))
     args = ["paplay", "--raw", "--format=s16le",
             f"--rate={TTS_SAMPLE_RATE}", "--channels=1"]
     if bt_sink_name:
@@ -590,29 +609,10 @@ async def _play_on_bt(pcm_bytes: bytes):
             log.warning(f"[BT-PLAY] paplay rc={proc.returncode}: "
                         f"{err.decode('utf-8','replace')[:200]}")
         else:
-            log.info(f"[BT-PLAY] played {len(pcm_bytes):,}B to {bt_sink_name or 'default sink'}")
+            log.info(f"[BT-PLAY] played {len(pcm_bytes):,}B to {bt_sink_name or 'default sink'} "
+                     f"(vol={settings.get('volume')}%)")
     except Exception as e:
         log.error(f"[BT-PLAY] {e}")
-
-
-def _apply_bt_volume(pct: int) -> None:
-    """Set the BT sink volume via pactl. Fire-and-forget; silent if pactl is absent."""
-    pct = max(0, min(100, int(pct)))
-    sink = bt_sink_name or "@DEFAULT_SINK@"
-    try:
-        import subprocess
-        subprocess.Popen(
-            ["pactl", "set-sink-volume", sink, f"{pct}%"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        log.info(f"[VOLUME] pactl {sink} -> {pct}%")
-    except FileNotFoundError:
-        log.debug("[VOLUME] pactl not installed — skipping (dev machine?)")
-    except Exception as e:
-        log.warning(f"[VOLUME] pactl failed: {e}")
-
-
-settings.on_change("volume", _apply_bt_volume)
 
 
 # ---------------------------------------------------------------------------
@@ -672,8 +672,8 @@ async def _pendant_gesture_poller():
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Apply current volume to BT sink at boot so pactl reflects settings.json.
-    _apply_bt_volume(settings.get("volume"))
+    # Software volume scaling happens in _play_on_bt per-playback; nothing to
+    # apply at boot.
     # Start pendant gesture poller if HELIOS_PENDANT_URL points somewhere.
     poller_task = None
     if PENDANT_BASE_URL:
@@ -789,18 +789,20 @@ async def photo_latest(resized: bool = False):
 
 @app.get("/audio/config")
 async def get_audio_config():
-    """ESP32 polls this for live volume updates."""
-    return {"volume": device_state["volume"]}
+    """Live volume polling. Backed by settings.volume (single source of truth)."""
+    return {"volume": settings.get("volume")}
 
 
 @app.post("/audio/config")
 async def set_audio_config(request: Request):
-    """curl -X POST -d '{"volume":50}' for live tuning."""
+    """curl -X POST -d '{"volume":50}' for live tuning. Persists to settings.json."""
     body = await request.json()
     if "volume" in body:
-        device_state["volume"] = max(0, min(100, int(body["volume"])))
-        log.info(f"[CONFIG] Volume set to {device_state['volume']}%")
-    return {"volume": device_state["volume"]}
+        try:
+            settings.set("volume", int(body["volume"]))
+        except (settings.SettingsError, ValueError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    return {"volume": settings.get("volume")}
 
 
 # ---------------------------------------------------------------------------
