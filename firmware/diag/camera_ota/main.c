@@ -46,6 +46,7 @@
 #include "diag_log.h"
 #include "button.h"
 #include "mic_probe.h"
+#include "ws_stream.h"
 #include "sd_card.h"
 #include "recovery.h"
 
@@ -288,6 +289,15 @@ void app_main(void)
     /* ---- Peripheral probes: button + mic ---- */
     button_init();
     mic_probe_init();
+
+    /* ---- Always-on mic streaming to Pi (wake-word path) ---- */
+    if (wer == ESP_OK) {
+        esp_err_t ser = ws_stream_start(HELIOS_STREAM_URI);
+        DLOG("[CAMDIAG] ws_stream_start -> 0x%x  (target %s)\n",
+             ser, HELIOS_STREAM_URI);
+    } else {
+        DLOG("[CAMDIAG] skip ws_stream_start — no WiFi\n");
+    }
 
     /* ---- Endurance loop: 1 fps, publish frames, 10s summary ---- */
     if (!camera_helios_is_ready()) {
