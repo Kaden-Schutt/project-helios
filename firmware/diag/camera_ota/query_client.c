@@ -20,6 +20,7 @@
 #include "diag_log.h"
 
 #include <string.h>
+#include <math.h>
 #include <inttypes.h>
 #include "esp_err.h"
 #include "esp_log.h"
@@ -92,40 +93,57 @@ static void query_task(void *arg)
 
         size_t offset = 0;
         size_t underruns = 0;
-        esp_err_t last_err = ESP_OK;
-        size_t last_got = 99999;
         while (button_is_holding() && offset + CHUNK_BYTES <= max_bytes) {
             size_t got = 0;
-            esp_err_t err = mic_helios_read(rec + offset, CHUNK_BYTES, &got, 200);
-            if (err != ESP_OK || got == 0) {
-                if (underruns < 3) {
-                    DLOG("[QUERY] mic_read err=0x%x got=%u (underrun #%u)\n",
-                         err, (unsigned)got, (unsigned)(underruns + 1));
-                }
-                underruns++;
-                last_err = err;
-                last_got = got;
-                continue;
-            }
+            /* i2s_channel_read can return ESP_ERR_TIMEOUT with got>0 when a
+             * partial buffer fill beats the timeout. The data is fine; only
+             * skip when nothing came through. */
+            (void)mic_helios_read(rec + offset, CHUNK_BYTES, &got, 200);
+            if (got == 0) { underruns++; continue; }
             offset += got;
         }
-        (void)last_err; (void)last_got;
         mic_probe_resume();
 
         int64_t t1 = esp_timer_get_time();
         float secs = offset / (float)(QUERY_SAMPLE_RATE * 2);
-        DLOG("[QUERY] hold released: %.2fs audio (%zu B, %u underruns) in %lld ms\n",
-             secs, offset, (unsigned)underruns, (long long)((t1 - t0) / 1000));
+
+        /* Quick audio sanity: RMS + peak over the whole recording + first few samples. */
+        uint64_t sq = 0;
+        uint16_t peak = 0;
+        const int16_t *s16 = (const int16_t *)rec;
+        size_t n_samples = offset / 2;
+        for (size_t i = 0; i < n_samples; i++) {
+            int32_t v = s16[i];
+            uint32_t av = v < 0 ? (uint32_t)(-v) : (uint32_t)v;
+            if (av > peak) peak = av;
+            sq += (uint64_t)v * (uint64_t)v;
+        }
+        uint32_t rms = n_samples ? (uint32_t)sqrtf((float)(sq / n_samples)) : 0;
+        DLOG("[QUERY] hold released: %.2fs audio (%zu B, %u underruns) in %lld ms  "
+             "rms=%u peak=%u first=%04x %04x %04x %04x %04x %04x %04x %04x\n",
+             secs, offset, (unsigned)underruns, (long long)((t1 - t0) / 1000),
+             (unsigned)rms, (unsigned)peak,
+             (unsigned)(uint16_t)s16[0], (unsigned)(uint16_t)s16[1],
+             (unsigned)(uint16_t)s16[2], (unsigned)(uint16_t)s16[3],
+             (unsigned)(uint16_t)s16[4], (unsigned)(uint16_t)s16[5],
+             (unsigned)(uint16_t)s16[6], (unsigned)(uint16_t)s16[7]);
 
         if (offset < CHUNK_BYTES) {
             DLOG("[QUERY] too short, skipping upload\n");
             continue;
         }
 
-        /* Snap a fresh JPEG. camera_helios_capture() returns a reused
-         * framebuffer — grab it, upload, release. */
+        /* Flush a few stale frames so the fb queue isn't dominated by motion
+         * blur captured while the user was raising the pendant. Each
+         * capture/return cycle gives AE/AWB a chance to converge. */
         uint8_t *jpeg = NULL;
         size_t jpeg_len = 0;
+        for (int i = 0; i < 3; i++) {
+            esp_err_t cerr = camera_helios_capture(&jpeg, &jpeg_len);
+            if (cerr == ESP_OK) camera_helios_return_fb();
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        /* Now grab the real frame (slightly settled). */
         esp_err_t cerr = camera_helios_capture(&jpeg, &jpeg_len);
         if (cerr == ESP_OK && jpeg && jpeg_len > 0) {
             http_post("/photo/upload", "image/jpeg", jpeg, jpeg_len, 10000);
