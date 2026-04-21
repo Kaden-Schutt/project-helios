@@ -223,7 +223,7 @@ async def stt_transcribe(audio_pcm: bytes) -> str:
     transcript_parts = []
 
     try:
-        async with websockets.connect(uri, additional_headers=headers) as ws:
+        async with websockets.connect(uri, extra_headers=headers) as ws:
             # Send audio in chunks (8KB ~ 0.25s of 16kHz s16le mono)
             chunk_size = 8192
             for i in range(0, len(audio_pcm), chunk_size):
@@ -606,12 +606,52 @@ def _scale_pcm_volume(pcm_s16le: bytes, pct: int) -> bytes:
     return arr.astype(np.int16).tobytes()
 
 
+import sys as _sys
+
 async def _play_on_bt(pcm_bytes: bytes):
-    """Pipe raw PCM into paplay on the Pi. Runs fully in the background.
+    """Play raw PCM through the system's default BT sink.
+
+    Linux (Pi prod): pipes into `paplay` with explicit s16le/24k mono.
+    macOS (dev):     wraps PCM in WAV and calls `afplay`; afplay routes to
+                     whatever the user has selected as default output —
+                     typically the MT BT speaker after pairing it.
+
     Volume is applied in software from settings.volume before playback."""
     if not pcm_bytes:
         return
     pcm_bytes = _scale_pcm_volume(pcm_bytes, settings.get("volume"))
+
+    if _sys.platform == "darwin":
+        # macOS path — afplay needs a WAV on disk.
+        wav = _pcm_to_wav(pcm_bytes, TTS_SAMPLE_RATE)
+        path = f"/tmp/helios-tts-{int(time.time()*1000)}.wav"
+        try:
+            with open(path, "wb") as f:
+                f.write(wav)
+            proc = await asyncio.create_subprocess_exec(
+                "afplay", path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await proc.communicate()
+            if proc.returncode != 0:
+                log.warning(f"[BT-PLAY] afplay rc={proc.returncode}: "
+                            f"{err.decode('utf-8','replace')[:200]}")
+            else:
+                log.info(f"[BT-PLAY] afplay played {len(pcm_bytes):,}B "
+                         f"(vol={settings.get('volume')}%)")
+        except FileNotFoundError:
+            log.error("[BT-PLAY] afplay not found — macOS path broken?")
+        except Exception as e:
+            log.error(f"[BT-PLAY] {e}")
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+        return
+
+    # Linux path — paplay with raw PCM
     args = ["paplay", "--raw", "--format=s16le",
             f"--rate={TTS_SAMPLE_RATE}", "--channels=1"]
     if bt_sink_name:
@@ -697,13 +737,31 @@ async def _on_wake_triggered():
     asyncio.create_task(_play_on_bt(_EARCON_PCM))
 
 
+async def _fetch_pendant_frame() -> str:
+    """Pull the pendant's most recent JPEG via /frame. Returns base64 or ''."""
+    if not PENDANT_BASE_URL:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{PENDANT_BASE_URL}/frame")
+            if r.status_code == 200 and r.content[:2] == b"\xff\xd8":
+                resized = resize_jpeg_for_llm(r.content, max_side=512)
+                log.info(f"[WAKE] fetched /frame: {len(r.content):,}B raw, {len(resized):,}B resized")
+                return base64.b64encode(resized).decode()
+    except Exception as e:
+        log.warning(f"[WAKE] /frame fetch failed: {e}")
+    return ""
+
+
 async def _on_wake_query(text: str):
     """Completed-capture handler — route through the same mode-aware path as
     /query. TTS plays via Pi BT sink; pendant is not a participant in playback."""
-    # Pull freshest JPEG available; pendant POSTs /photo/upload continuously while
-    # streaming (ideally). If none present, proceed without image (text-only).
+    # Prefer the freshest JPEG we have in device_state (e.g. from /photo/upload);
+    # otherwise pull it live from the pendant's /frame endpoint.
     image_b64 = device_state.get("jpeg_b64") or ""
     device_state["jpeg_b64"] = None
+    if not image_b64:
+        image_b64 = await _fetch_pendant_frame()
 
     if mode_state["mode"] == "query" and _is_settings_entry(text):
         _enter_settings_mode()
@@ -1121,7 +1179,7 @@ async def ws_query(ws: WebSocket):
                    f"?model={STT_MODEL}&encoding={STT_ENCODING}"
                    f"&sample_rate={STT_SAMPLE_RATE}&language=en")
         stt_headers = {"X-API-Key": CARTESIA_API_KEY, "Cartesia-Version": CARTESIA_VERSION}
-        stt_ws = await websockets.connect(stt_uri, additional_headers=stt_headers)
+        stt_ws = await websockets.connect(stt_uri, extra_headers=stt_headers)
         log.info("[WS] STT stream opened, waiting for ESP data...")
 
         # --- Receive JPEG + mic PCM from ESP ---

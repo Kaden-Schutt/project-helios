@@ -148,7 +148,7 @@ class WakeStream:
             f"&language=en"
         )
         headers = {"X-API-Key": self.api_key, "Cartesia-Version": CARTESIA_VERSION}
-        self._stt_ws = await websockets.connect(uri, additional_headers=headers)
+        self._stt_ws = await websockets.connect(uri, extra_headers=headers)
         log.info("[WAKE] STT stream open")
 
     async def _reconnect_with_backoff(self):
