@@ -616,13 +616,78 @@ settings.on_change("volume", _apply_bt_volume)
 
 
 # ---------------------------------------------------------------------------
+# Pendant gesture dispatch (Pi polls pendant /button, maps gestures to mode)
+# ---------------------------------------------------------------------------
+PENDANT_BASE_URL = os.getenv("HELIOS_PENDANT_URL", "http://helios-cam.local")
+PENDANT_POLL_S   = 0.2
+
+
+async def _pendant_on_gesture(g: str):
+    """Route one pendant gesture to its side-effect. No-op for gestures whose
+    action isn't wired yet — those get logged so we can see them in the field."""
+    log.info(f"[PENDANT] gesture: {g}  (mode={mode_state['mode']})")
+    if g == "triple_tap":
+        if mode_state["mode"] == "settings":
+            _exit_settings_mode()
+        else:
+            _enter_settings_mode()
+    elif g == "double_tap":
+        # Repeat last response — just replay the TTS mirror.
+        if tts_mirror["wav"]:
+            log.info("[PENDANT] replaying last TTS")
+            # Extract PCM from WAV (strip 44-byte RIFF header for raw).
+            raw_pcm = tts_mirror["wav"][44:]
+            asyncio.create_task(_play_on_bt(raw_pcm))
+    elif g == "triple_tap_hold":
+        log.info("[PENDANT] triple_tap_hold received — agent mode deferred")
+    elif g == "quint_tap":
+        log.info("[PENDANT] quint_tap received — sleep toggle deferred")
+    elif g == "long_hold":
+        log.info("[PENDANT] long_hold received — privacy pause deferred")
+    # hold_start / hold_end are handled by the /ws query flow, not here.
+
+
+async def _pendant_gesture_poller():
+    """Polls pendant /button on a timer, drains gestures, dispatches.
+    Tolerant of the pendant being offline (backoff + retry). Cancelled on shutdown."""
+    backoff = PENDANT_POLL_S
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while True:
+            try:
+                r = await client.get(f"{PENDANT_BASE_URL}/button")
+                if r.status_code == 200:
+                    data = r.json()
+                    for g in data.get("gestures", []):
+                        await _pendant_on_gesture(g)
+                    backoff = PENDANT_POLL_S
+                else:
+                    backoff = min(backoff * 2, 5.0)
+            except Exception:
+                backoff = min(max(backoff * 2, 1.0), 5.0)
+            await asyncio.sleep(backoff)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # Apply current volume to BT sink at boot so pactl reflects settings.json.
     _apply_bt_volume(settings.get("volume"))
-    yield
+    # Start pendant gesture poller if HELIOS_PENDANT_URL points somewhere.
+    poller_task = None
+    if PENDANT_BASE_URL:
+        log.info(f"[PENDANT] poller → {PENDANT_BASE_URL} every {PENDANT_POLL_S*1000:.0f}ms")
+        poller_task = asyncio.create_task(_pendant_gesture_poller())
+    try:
+        yield
+    finally:
+        if poller_task:
+            poller_task.cancel()
+            try:
+                await poller_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(title="Helios Relay Server", lifespan=_lifespan)
@@ -779,6 +844,23 @@ async def post_exit_settings():
     """Force-exit settings mode (sighted helper / admin override)."""
     _exit_settings_mode()
     return {"mode": mode_state["mode"]}
+
+
+@app.post("/pendant-event")
+async def pendant_event(request: Request):
+    """Push-based gesture dispatch — pendant can POST {"gesture": "triple_tap"}
+    instead of waiting to be polled. Useful for lower-latency path once we add
+    esp_http_client on the pendant. Currently the /button poller is the live
+    path; this endpoint is an alternative."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    g = (body.get("gesture") or "").strip()
+    if not g:
+        return JSONResponse({"error": "missing 'gesture'"}, status_code=400)
+    await _pendant_on_gesture(g)
+    return {"ok": True, "mode": mode_state["mode"]}
 
 
 @app.post("/query")
