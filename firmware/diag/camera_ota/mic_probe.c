@@ -9,6 +9,7 @@
 #include "mic_probe.h"
 #include "mic_helios.h"
 #include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,10 @@
 static volatile uint32_t s_rms = 0;
 static volatile uint32_t s_peak = 0;
 static volatile uint64_t s_frames = 0;
+static volatile bool     s_suspended = false;
+
+void mic_probe_suspend(void) { s_suspended = true;  }
+void mic_probe_resume(void)  { s_suspended = false; }
 
 static void mic_task(void *arg)
 {
@@ -33,6 +38,7 @@ static void mic_task(void *arg)
     int wi = 0;
 
     while (1) {
+        if (s_suspended) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         size_t got = 0;
         esp_err_t err = mic_helios_read(buf, N, &got, 200);
         if (err != ESP_OK || got == 0) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
