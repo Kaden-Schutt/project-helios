@@ -2,7 +2,7 @@
 Description=Helios WiFi Import — read /boot/firmware/wifi.conf into NetworkManager
 After=NetworkManager.service
 Requires=NetworkManager.service
-Before=helios-ble.service
+Before=helios-server.service
 
 [Service]
 Type=oneshot

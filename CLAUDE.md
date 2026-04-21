@@ -2,69 +2,74 @@
 
 ## What This Is
 
-A wearable assistive device for vision-impaired individuals. Two physical units communicate over WiFi:
+A wearable assistive device for vision-impaired individuals. Three physical units:
 
-1. **Pendant** (XIAO ESP32S3 Sense) — worn on chest, has camera, mic, speaker, 2x ultrasonic sensors, 2x buzzers, button
-2. **Belt unit** (Raspberry Pi 4B) — fanny pack, runs cloud API pipeline, has rear ultrasonic sensor + vibration motor
+1. **Pendant** (XIAO ESP32-S3 Sense) — worn on chest, has camera, PDM mic, button. No speaker on pendant.
+2. **Belt unit** (Raspberry Pi 4B) — fanny pack, runs cloud API pipeline, has rear ultrasonic sensor + vibration motor, BT-paired to MT speaker.
+3. **Forward-safety pods** (2x RP2040) — independent ultrasonic + buzzer modules on the front of the wearable. No comms with anything else.
 
 ## Architecture
 
 ### Three Independent Loops
 
-1. **Forward Safety Loop** (pendant, always on, no WiFi)
-   - 2x HC-SR04 ultrasonic sensors poll at 10Hz
-   - Left/right buzzers fire when obstacles detected (<100cm pulse, <30cm continuous)
-   - Runs on ESP32 only — zero network dependency
+1. **Forward Safety Loop** — RP2040 pods, always on, standalone.
+   Two pods each run an HC-SR04 + buzzer. Zero dependency on pendant or Pi.
 
-2. **Rear Safety Loop** (belt, always on, no WiFi)
-   - 1x rear-facing HC-SR04 on Pi
-   - Vibration motor intensity proportional to proximity
-   - Fully independent from pendant
+2. **Rear Safety Loop** — Pi, always on, no WiFi.
+   `rear_safety.py`: 1x rear HC-SR04 → vibration motor PWM, intensity proportional to proximity.
 
-3. **AI Query Loop** (pendant + belt, on-demand via button)
-   - Button hold → camera JPEG + mic PCM capture
-   - Button release → WiFi on → POST JSON to Pi → WiFi off
-   - Pi pipeline: Cartesia Ink-Whisper (STT) → Gemini 3.1 Pro via OpenRouter (vision) → Cartesia Sonic 3 (TTS)
-   - TTS audio sent back to ESP32, played through speaker
-   - Round-trip: ~5-6 seconds
+3. **AI Query Loop** — pendant ↔ Pi over WiFi, on-demand via button.
+   - Button hold: pendant streams PCM audio via chunked HTTP to Pi, continues capturing JPEG.
+   - Button release: pendant POSTs JPEG to Pi, closes audio stream.
+   - Pi pipeline: Cartesia Ink-Whisper (STT, streaming) → Claude Haiku 4.5 via Anthropic API (vision) → Cartesia Sonic 3 (TTS) → direct A2DP playback to MT BT speaker.
+   - Pendant does not handle audio output. Pi owns the speaker.
+
+### Transport
+
+- **Pendant ↔ Pi: WiFi HTTP only.** WiFi stays up (OTA + admin server is always listening).
+- **Pi → MT speaker: BT A2DP** via system bluez on Pi.
+- **BLE on pendant: OTA rescue only.** If WiFi enrollment fails, pendant pivots to `ble_recovery.signed.bin` from SD and serves a NimBLE GATT rescue endpoint. No BLE transport anywhere in the product path.
 
 ### Pin Assignments
 
-**Safety Loop (base board, no Sense):**
+**Pendant (XIAO ESP32-S3 Sense):**
 | Pin | Function |
 |-----|----------|
-| D0/GPIO1 | Left HC-SR04 TRIG |
-| D1/GPIO2 | Left HC-SR04 ECHO |
-| D2/GPIO3 | Left Buzzer (+) |
-| D8/GPIO7 | Right HC-SR04 TRIG |
-| D9/GPIO8 | Right HC-SR04 ECHO |
-| D10/GPIO9 | Right Buzzer (+) |
+| GPIO 44 (D7) | Push button (active-high, 3.3V supply) |
+| GPIO 40/39 | Camera SCCB (SDA/SCL) |
+| GPIO 10 | Camera XCLK |
+| GPIO 41/42 | PDM mic DATA / CLK |
+| GPIO 7/8/9/21 | microSD SPI (CS/CLK/MISO/MOSI) — onboard pullups, do not repurpose |
+| Camera DVP | GPIO 10–18, 38–40, 47, 48 (Sense board internal) |
 
-**AI Query Loop (Sense board):**
-| Pin | Function |
-|-----|----------|
-| D3/GPIO4 | Push button OUT |
-| D4/GPIO5 | MAX98357A LRC |
-| D5/GPIO6 | MAX98357A BCLK |
-| D6/GPIO43 | MAX98357A DIN |
-| Camera/Mic | Built into Sense expansion board |
+**Belt (Pi 4B):** see `rear_safety.py` for rear HC-SR04 + motor PWM pinout.
+
+**Forward-safety pods:** each RP2040 owns its own HC-SR04 + buzzer; pinouts live with the pod firmware, not here.
 
 ## Codebase
 
 ```
-firmware/              # ESP32 C code (ESP-IDF via PlatformIO)
-  src/main.c           # Entry point, safety loop + query loop state machine
-  src/camera.c         # OV2640 JPEG capture
-  src/mic.c            # PDM microphone PCM recording
-  include/helios.h     # Pin definitions, config
-  platformio.ini       # Build config (XIAO ESP32S3 Sense target)
+firmware/
+  diag/camera_ota/      # Active pendant fw: camera + mic + button + OTA + admin + SD recovery
+  diag/ble_recovery/    # Standalone NimBLE rescue fw, loaded from SD when WiFi fails
+  test_apps/            # wifi_throughput.c (standalone WiFi bench)
+  src/                  # wifi.c — ESP-IDF WiFi abstraction used by wifi_throughput
+  platformio.ini        # wifi_test env only (real fw is under firmware/diag/)
 
-server.py              # Pi HTTP server — receives JSON, runs STT→Vision→TTS pipeline
-client.py              # Test client for server.py
-usb_receiver.py        # USB serial receiver for dev/testing
-tests/                 # Test images and scenario scripts
-diagram.json           # Wokwi circuit simulator (Safety Loop)
-wokwi.toml             # Wokwi firmware pointer
+server.py               # Pi WiFi HTTP server — STT → Claude Haiku → TTS, plays via Pi BT to MT
+client.py               # Test client for server.py
+rear_safety.py          # Pi rear ultrasonic + vibration motor loop (systemd unit)
+throughput_server.py    # HTTP throughput test server for WiFi debugging
+
+scripts/
+  ble_ota.py            # Bleak-based BLE rescue push client (OTA fallback only)
+  sign_ota.py           # HMAC-SHA256 signer for OTA images
+  gen_ota_key.py        # Generates OTA signing key + pubkey header
+  package_ota.py        # Emits tagged <name>-<tag>-<version>.signed.bin + yaml
+  setup.sh              # Pi bootstrap (system deps, venv, systemd units)
+  prep-pi4b-sd.sh       # One-shot Pi 4B SD card provisioning
+
+docs/OTA_STACK.md       # Full OTA + recovery architecture reference — source of truth
 ```
 
 ## Team
@@ -81,32 +86,33 @@ wokwi.toml             # Wokwi firmware pointer
 
 - Each team member has a browser-based VS Code at `helios.schutt.dev`
 - Each person works on their own git branch
-- Claude Code (this tool) is pre-configured with Sonnet 4.6 and full permissions
-- PlatformIO, clangd, Python, Wokwi simulator are pre-installed
-- `.env` has API keys for Cartesia, OpenRouter, etc. — never commit it
+- PlatformIO, clangd, Python are pre-installed
+- `.env` has API keys for Cartesia + Anthropic — never commit it
 
 ## Key Commands
 
 ```bash
-pio run                      # Build firmware
-pio run --target upload      # Flash ESP32 (needs physical board)
-python3 server.py            # Run Pi server locally
-python3 client.py            # Test the server
+# Build + OTA-push active pendant fw
+ssh kaden@k9lin.local 'bash -lc "cd ~/helios-diag-camera-ota && pio run"'
+scp kaden@k9lin.local:helios-diag-camera-ota/.pio/build/xiao_esp32s3/firmware.bin /tmp/helios-bins/staged/firmware.bin
+python3 scripts/sign_ota.py /tmp/helios-bins/staged/firmware.bin
+curl --data-binary @/tmp/helios-bins/staged/firmware.signed.bin http://helios-cam.local/ota
+
+# Pi-side server (dev on Mac or prod on Pi)
+python3 server.py
+
+# Test client
+python3 client.py
 ```
 
 ## Design Constraints
 
 - Raspberry Pi 4B as central hub (required by course)
-- XIAO ESP32S3 Sense as pendant controller
-- WiFi only active during query transfer (duty cycling for battery)
-- All safety loops must work without internet
+- XIAO ESP32-S3 Sense as pendant controller
+- All safety loops must work without internet (RP2040 pods + Pi rear loop satisfy this)
 - Total additional sensor budget: $25
 - Must be wearable, discreet, lightweight
 
 ## Timeline
 
-- **Week 10 (Mar 24-26):** Core functionality — safety loops + query pipeline working
-- **Week 11 (Mar 31-Apr 2):** Integration — pendant + belt communicating
-- **Week 12 (Apr 7-9):** Refinement + documentation
-- **Week 13 (Apr 14-16):** Final presentation
-- **Demo Day: April 21**
+- **Demo Day: April 21, 2026** (today)

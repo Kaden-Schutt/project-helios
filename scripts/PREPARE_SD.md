@@ -42,8 +42,8 @@ ssh pi@helios.local
 curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/project-helios/main/scripts/setup.sh | sudo bash
 ```
 
-This takes 10–15 minutes (most of it is compiling Rust/bluer). The script
-is idempotent — if it fails partway, re-run it.
+This takes 3–5 minutes (system packages + Python deps). The script is
+idempotent — if it fails partway, re-run it.
 
 ### 3. Drop in your `.env`
 
@@ -55,8 +55,8 @@ scp .env pi@helios.local:/home/pi/project-helios/.env
 
 ```bash
 ssh pi@helios.local
-sudo systemctl start helios-ble rear_safety
-sudo systemctl status helios-ble
+sudo systemctl start helios-server rear_safety
+sudo systemctl status helios-server
 ```
 
 Done. On boot, the services come up automatically.
@@ -236,15 +236,12 @@ ssh pi@<ip-from-phone>
 
 ## Troubleshooting
 
-**`setup.sh` fails at Rust/cargo stage**: out of RAM. The OrangePi Zero 2W
-has 1-4GB depending on variant; make sure swap is enabled or use the 4GB variant.
+**`helios-server` fails to start**: check `.env` has CARTESIA_API_KEY and
+ANTHROPIC_API_KEY set. `journalctl -u helios-server -f` for details.
 
-**`helios-ble` fails to start with "Helios not found"**: ESP32 isn't
-advertising. Check it's powered and not bonded to another central (your Mac).
+**MT speaker not playing TTS**: pair + connect via `bluetoothctl` before
+starting the service. Verify with `aplay -D bluealsa:DEV=41:42:40:3A:47:17
+test.wav`.
 
-**`MTU 23` errors**: the `helios_ble` Rust extension didn't build — check
-`maturin develop --release` completed. See `rust/helios_ble/README.md`.
-
-**No WiFi on OrangePi Zero 2W**: Armbian sometimes needs
-`nmtui` on first boot to scan + connect. SSH via ethernet, configure
-WiFi with `nmtui`, reboot.
+**No WiFi on OrangePi Zero 2W**: Armbian sometimes needs `nmtui` on first
+boot to scan + connect. SSH via ethernet, configure WiFi with `nmtui`, reboot.

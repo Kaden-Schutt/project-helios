@@ -7,7 +7,6 @@ set -euo pipefail
 SRC_IMG_XZ=/tmp/dietpi-rpi4.img.xz
 WORK=/tmp/helios-build
 OUT_IMG=$WORK/helios-pi4b.img
-WHEEL_SRC=/home/kaden/helios-build/project-helios/wheels/helios_ble-0.1.0-cp38-abi3-linux_aarch64.whl
 
 mkdir -p $WORK
 cd $WORK
@@ -40,9 +39,6 @@ sudo mount ${LOOP}p1 $WORK/root/boot 2>/dev/null || true
 log 'Copying qemu-aarch64-static into chroot...'
 sudo cp /usr/bin/qemu-aarch64-static $WORK/root/usr/bin/
 
-log 'Copying helios_ble wheel into chroot...'
-sudo cp $WHEEL_SRC $WORK/root/root/ 2>/dev/null || echo 'no wheel'
-
 log 'Binding /proc /sys /dev...'
 sudo mount --bind /proc $WORK/root/proc
 sudo mount --bind /sys $WORK/root/sys
@@ -56,7 +52,11 @@ set -e
 echo "--- chroot running ---"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends     git curl ca-certificates pkg-config build-essential     libopus-dev libdbus-1-dev libssl-dev     python3 python3-venv python3-dev python3-pip     bluez bluez-tools avahi-daemon avahi-utils
+apt-get install -y --no-install-recommends \
+    git curl ca-certificates pkg-config build-essential \
+    libopus-dev libssl-dev \
+    python3 python3-venv python3-dev python3-pip \
+    bluez bluez-tools bluez-alsa-utils avahi-daemon avahi-utils
 
 echo "--- cloning helios repo ---"
 git clone --depth 1 --branch main https://github.com/Kaden-Schutt/project-helios.git /root/project-helios
@@ -64,26 +64,15 @@ git clone --depth 1 --branch main https://github.com/Kaden-Schutt/project-helios
 echo "--- creating venv ---"
 python3 -m venv /root/project-helios/.venv
 /root/project-helios/.venv/bin/pip install --upgrade pip wheel
-/root/project-helios/.venv/bin/pip install     opuslib httpx websockets python-dotenv     anthropic numpy fastapi uvicorn
+/root/project-helios/.venv/bin/pip install \
+    httpx websockets python-dotenv \
+    anthropic numpy fastapi uvicorn \
+    bleak opuslib
 
-echo "--- installing helios_ble wheel ---"
-if ls /root/helios_ble-*.whl >/dev/null 2>&1; then
-    /root/project-helios/.venv/bin/pip install --force-reinstall /root/helios_ble-*.whl
-    rm /root/helios_ble-*.whl
-else
-    echo "WARN: no wheel found"
-fi
-
-echo "--- verify helios_ble ---"
-/root/project-helios/.venv/bin/python -c "import helios_ble; print(helios_ble.MIN_MTU)" || echo "helios_ble import failed"
-
-echo "--- bluez MTU config ---"
-sed -i '\''s/^#ExchangeMTU.*/ExchangeMTU = 517/'\'' /etc/bluetooth/main.conf || true
-
-echo "--- systemd helios-ble.service ---"
-cat > /etc/systemd/system/helios-ble.service <<EOF
+echo "--- systemd helios-server.service ---"
+cat > /etc/systemd/system/helios-server.service <<EOF
 [Unit]
-Description=Helios BLE Voice + Vision Server
+Description=Helios Voice + Vision Server (WiFi HTTP)
 After=bluetooth.service network-online.target
 Wants=bluetooth.service
 
@@ -91,7 +80,7 @@ Wants=bluetooth.service
 Type=simple
 User=root
 WorkingDirectory=/root/project-helios
-ExecStart=/root/project-helios/.venv/bin/python server_ble.py
+ExecStart=/root/project-helios/.venv/bin/python server.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

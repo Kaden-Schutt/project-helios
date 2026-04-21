@@ -1,68 +1,71 @@
 # Project Helios
 
-A wearable assistive device for vision-impaired individuals. Two physical units communicate over BLE:
+A wearable assistive device for vision-impaired individuals. Three units:
 
-1. **Pendant** (XIAO ESP32S3 Sense) — worn on chest; has camera, microphone, speaker, button
-2. **Belt unit** (Raspberry Pi 4B) — fanny pack; runs the AI pipeline
+1. **Pendant** (XIAO ESP32-S3 Sense) — chest-worn; has camera, PDM microphone, button. No speaker.
+2. **Belt unit** (Raspberry Pi 4B) — fanny pack; runs the AI pipeline and drives a paired BT speaker.
+3. **Forward-safety pods** (2× RP2040) — independent ultrasonic + buzzer modules on the front of the wearable.
 
-Press and hold the button, ask a question about your surroundings, release. The device captures what the camera sees, transcribes your speech, asks an AI that can see the image, and speaks the answer back — all in about 2 seconds.
+Press and hold the button, ask a question about your surroundings, release. The pendant streams mic audio and a JPEG to the Pi over WiFi; the Pi transcribes, asks Claude Haiku to answer about the image, and speaks the answer back over its paired BT speaker.
 
 ## How It Works
 
 ```
-  PENDANT (ESP32)                              BELT (Raspberry Pi)
- ┌──────────────────┐          BLE            ┌───────────────────────┐
- │                  │  ── JPEG + Opus mic ──> │                       │
- │  Button held:    │                         │  1. STT (Cartesia)    │
- │    Camera snap   │                         │  2. Vision LLM        │
- │    Mic stream    │                         │     (Claude Haiku)    │
- │                  │  <── Opus TTS stream ── │  3. TTS (Cartesia)    │
- │  Button released:│                         │     streamed back     │
- │    Speaker plays │                         │                       │
- └──────────────────┘                         └───────────────────────┘
+   PENDANT (ESP32-S3)                    BELT (Raspberry Pi 4B)           MT BT speaker
+ ┌────────────────────┐    WiFi HTTP    ┌──────────────────────┐            ┌────────┐
+ │  Button held:      │ ──────────────> │  1. STT (Cartesia)   │            │        │
+ │    Camera JPEG     │   chunked PCM   │  2. Vision LLM       │   A2DP     │        │
+ │    Mic PCM stream  │   + JPEG POST   │     (Claude Haiku)   │ ─────────> │        │
+ │                    │                 │  3. TTS (Cartesia)   │   bluez    │        │
+ │  (WiFi always on,  │                 │     played directly  │            │        │
+ │   OTA + admin also │                 │     over BT          │            │        │
+ │   served)          │                 │                      │            │        │
+ └────────────────────┘                 └──────────────────────┘            └────────┘
+
+   Front-safety pods (2× RP2040) own their own HC-SR04 + buzzer — no comms with anything.
 ```
-
-**Peripheral lifecycle:** Only one group is active at a time. During recording, the speaker amp is powered off. During playback, the camera and mic are powered off. This eliminates electrical noise and allows higher speaker volume.
-
-**Streaming TTS:** Audio plays as it generates — the Pi streams Opus frames over BLE with a 300ms buffer, so the speaker starts ~1-2 seconds after button release instead of ~5 seconds.
 
 ## Hardware
 
 | Component | Part | Notes |
 |-----------|------|-------|
-| MCU | XIAO ESP32S3 Sense | Dual-core 240MHz, 8MB PSRAM, 8MB flash |
-| Camera | OV2640 | On Sense board, 640x480 JPEG |
-| Microphone | MSM261S4030H0 | On Sense board, PDM, 16kHz |
-| Speaker amp | MAX98357A | I2S, +15dB gain (GAIN=GND) |
-| Speaker | 3W 8 ohm | Driven by MAX98357A |
-| Button | Momentary push | GPIO 4 |
-| SD card | MicroSD | On Sense board, config storage |
-| Hub | Raspberry Pi 4B | Runs Python BLE server |
+| Pendant MCU | XIAO ESP32-S3 Sense | Dual-core 240 MHz, 8 MB PSRAM, 8 MB flash |
+| Camera | OV3660/OV2640 | On Sense expansion board, JPEG |
+| Microphone | PDM | On Sense board, 16 kHz |
+| Button | Momentary push | GPIO 44 (D7) |
+| microSD | SanDisk 64 GB FAT32 | On Sense expansion board; holds OTA rescue + wifi.conf |
+| Belt hub | Raspberry Pi 4B | Runs `server.py`, paired to MT BT speaker |
+| Speaker | MT generic BT speaker | A2DP sink, paired to Pi |
+| Charger | TP4057 with JST | Li-ion cell, single JST swap between XIAO and charger |
+| Front-safety pods | 2× RP2040 + HC-SR04 + buzzer | Independent, no pendant/Pi comms |
 
 ## Repository Structure
 
 ```
 project-helios/
-├── firmware/                    # ESP32 firmware (C, ESP-IDF via PlatformIO)
-│   ├── src/
-│   │   ├── main.c              # State machine, peripheral lifecycle, speaker task
-│   │   ├── speaker.c           # I2S output, Opus decode, DSP filters, streaming
-│   │   ├── mic.c               # PDM microphone input
-│   │   ├── camera.c            # OV2640 JPEG capture
-│   │   ├── ble.c               # NimBLE GATT server, BLE protocol
-│   │   ├── config.c            # JSON config persistence
-│   │   └── sdcard.c            # SD card SPI driver
-│   ├── include/
-│   │   └── helios.h            # Pin defs, API declarations, config struct
-│   └── platformio.ini          # Build configuration
-├── server_ble.py               # Pi BLE server (production) — full pipeline
-├── server.py                   # HTTP test server (development)
-├── client.py                   # HTTP test client (development)
-├── usb_receiver.py             # USB serial receiver (development)
-├── tests/                      # BLE protocol tests, throughput tests
-├── docs/                       # Firmware documentation + design specs
-├── diagram.json                # Wokwi circuit simulator
-└── requirements.txt            # Python dependencies
+├── firmware/
+│   ├── diag/camera_ota/            # Active pendant firmware
+│   │   ├── main.c                  # Entry, recovery check, WiFi, HTTP server
+│   │   ├── ota.c / ota_verify.c    # Streaming HMAC-SHA256 signed OTA
+│   │   ├── admin.c                 # /admin partition + SD library endpoints
+│   │   ├── sd_card.c               # SD mount + wifi.conf parser
+│   │   ├── recovery.c              # 3-tier recovery (rollback → SD → BLE pivot)
+│   │   └── platformio.ini          # -DFW_TAG="debug"
+│   ├── diag/ble_recovery/          # Standalone NimBLE rescue firmware (SD-loaded)
+│   ├── test_apps/wifi_throughput.c # Standalone WiFi bench
+│   └── src/wifi.c                  # WiFi helper used by throughput test
+├── server.py                       # Pi WiFi HTTP server — STT → Claude → TTS → BT
+├── client.py                       # Test client for server.py
+├── rear_safety.py                  # Pi rear ultrasonic + vibration motor (systemd)
+├── throughput_server.py            # HTTP throughput bench for WiFi debug
+├── scripts/
+│   ├── setup.sh                    # Pi bootstrap (apt + venv + systemd)
+│   ├── prep-pi4b-sd.sh             # One-shot Pi 4B SD provisioning
+│   ├── ble_ota.py                  # BLE rescue push client (OTA fallback only)
+│   ├── sign_ota.py / gen_ota_key.py / package_ota.py  # OTA tooling
+│   └── helios-wifi-import.{sh,service}  # Boot-time wifi.conf → NetworkManager
+├── docs/OTA_STACK.md               # OTA architecture + endpoint reference
+└── requirements.txt
 ```
 
 ## Setup
@@ -78,80 +81,46 @@ cp .env.example .env
 #   TTS_VOICE_ID        — (optional) Cartesia voice ID
 ```
 
-Run the BLE server:
+Pair the MT BT speaker to the Pi once (`bluetoothctl` → scan, pair, trust, connect). Then:
+
 ```bash
-python server_ble.py
+python server.py
 ```
 
-### Firmware (ESP32)
+### Pendant Firmware (OTA-first)
+
+Build on the k9lin build host and push signed OTA — no USB needed after the initial flash:
 
 ```bash
-# Build (requires PlatformIO + ESP-IDF toolchain)
-cd firmware
-pio run -e xiao_esp32s3
-
-# Flash
-esptool --chip esp32s3 --port /dev/cu.usbmodem101 --baud 921600 \
-  write-flash 0x0 .pio/build/xiao_esp32s3/bootloader.bin \
-              0x8000 .pio/build/xiao_esp32s3/partitions.bin \
-              0x10000 .pio/build/xiao_esp32s3/firmware.bin
+ssh kaden@k9lin.local 'bash -lc "cd ~/helios-diag-camera-ota && pio run"'
+scp kaden@k9lin.local:helios-diag-camera-ota/.pio/build/xiao_esp32s3/firmware.bin /tmp/helios-bins/staged/firmware.bin
+python3 scripts/sign_ota.py /tmp/helios-bins/staged/firmware.bin
+curl --data-binary @/tmp/helios-bins/staged/firmware.signed.bin http://helios-cam.local/ota
 ```
 
-### HTTP Test Mode (no hardware needed)
+See [`docs/OTA_STACK.md`](docs/OTA_STACK.md) for the full architecture, recovery tiers, admin endpoints, and signing model.
+
+### HTTP Test Mode (no pendant needed)
 
 ```bash
-# Terminal 1: start test server
+# Terminal 1
 python server.py
 
-# Terminal 2: run test client (hold spacebar to talk)
-python client.py
+# Terminal 2
+python client.py    # hold spacebar to talk
 ```
 
-## BLE Protocol
-
-Four BLE characteristics on a single GATT service:
-
-| Characteristic | UUID suffix | Direction | Purpose |
-|---------------|-------------|-----------|---------|
-| Mic TX | `...4322` | ESP → Pi | JPEG + Opus mic audio (multiplexed) |
-| Speaker RX | `...4323` | Pi → ESP | Opus TTS audio stream |
-| Control | `...4324` | Both | Button events, volume, status |
-
-### Mic → Pi (multiplexed on Mic TX)
-
-```
-JPEG:   0xFFFFFFFE + uint32_le(length) + data chunks
-Opus:   0xFFFFFFFF + [uint16_le(len)][frame]... + empty notification
-```
-
-### Pi → ESP (on Speaker RX)
-
-```
-Start:  0xFFFFFFFF (4 bytes)
-Data:   [uint16_le(frame_len)][opus_frame]... (packed into BLE writes)
-End:    empty write (0 bytes)
-```
-
-## Audio Pipeline
-
-**Capture** (ESP32): PDM mic → 16kHz 16-bit PCM → Opus encode (24kbps VOIP, 20ms frames) → BLE
-
-**AI** (Pi): Opus decode → Cartesia STT → Claude Haiku (with JPEG) → Cartesia TTS (WebSocket streaming)
-
-**Playback** (ESP32): BLE → PSRAM buffer → Opus decode → 200Hz high-pass biquad → low-pass → volume scale → I2S stereo → MAX98357A → speaker
-
-## Pin Map
+## Pin Map (Pendant — XIAO ESP32-S3 Sense)
 
 | GPIO | Function | GPIO | Function |
 |------|----------|------|----------|
-| 4 | Button | 41 | Mic DATA |
-| 5 | Speaker LRC (I2S WS) | 42 | Mic CLK |
-| 6 | Speaker BCLK | 10 | Camera XCLK |
-| 43 | Speaker DIN | 13 | Camera PCLK |
-| 21 | SD CS | 39 | Camera SIOC |
-| 7 | SD SCK | 40 | Camera SIOD |
-| 8 | SD MISO | 38 | Camera VSYNC |
-| 9 | SD MOSI | 47 | Camera HREF |
+| 44 (D7) | Push button (active-high) | 41 | PDM mic DATA |
+| 39 | Camera SIOC (SCCB) | 42 | PDM mic CLK |
+| 40 | Camera SIOD (SCCB) | 10 | Camera XCLK |
+| 21 | SD CS  | 7 | SD SCK |
+| 8  | SD MISO | 9 | SD MOSI |
+
+GPIO 7/8/9/21 each have an onboard pullup to 3V3 — do not repurpose them for buttons. GPIO 0/3/45/46 are strapping pins, also avoid.
 
 ## Team
 
@@ -165,5 +134,5 @@ End:    empty write (0 bytes)
 
 ## Documentation
 
-- [`docs/firmware-overview.md`](docs/firmware-overview.md) — Detailed firmware architecture, memory layout, module descriptions
+- [`docs/OTA_STACK.md`](docs/OTA_STACK.md) — OTA, recovery tiers, admin endpoints, signing
 - [`CLAUDE.md`](CLAUDE.md) — AI assistant configuration for this project

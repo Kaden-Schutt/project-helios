@@ -1,8 +1,5 @@
-# Helios BLE Voice + Vision Server
+# Helios Voice + Vision Server (Pi-side)
 # Install: pip install -r requirements.txt
-
-# BLE
-bleak>=0.21.0
 
 # APIs
 anthropic>=0.40.0
@@ -15,3 +12,6 @@ numpy>=1.24.0
 
 # Config
 python-dotenv>=1.0.0
+
+# BLE (for OTA rescue push to pendant via scripts/ble_ota.py only)
+bleak>=0.21.0
