@@ -61,11 +61,39 @@ The main firmware auto-mounts microSD at `/sd` on boot. Files the firmware knows
 | Path | Writer | Purpose |
 |---|---|---|
 | `/sd/wifi.conf` | user (via `POST /wifi`) | Network priority list. See format below. |
-| `/sd/recovery.signed.bin` | firmware (on `mark_valid`) | Last-known-good signed main fw. Loaded into inactive slot if boot counter exceeds threshold. |
-| `/sd/recovery.staging.bin` | firmware (during `POST /ota`) | Staging area; promoted atomically on `mark_valid`. |
+| `/sd/recovery.signed.bin` | firmware (on `mark_valid`, prod-tagged only) | Last-known-good signed main fw. Loaded into inactive slot if boot counter exceeds threshold. |
+| `/sd/recovery.staging.bin` | firmware (during `POST /ota`) | Staging area; promoted atomically on `mark_valid` if `FW_TAG==prod`. |
 | `/sd/ble_recovery.signed.bin` | user (initial setup) | Standalone BLE rescue fw. Loaded into inactive slot when WiFi connect fails. |
+| `/sd/firmwares/*.signed.bin` | user (via `POST /admin/upload-fw`) | Firmware library — named by `<name>-<tag>-<version>.signed.bin` convention. Boot via `POST /admin/boot-from-sd`. |
+| `/sd/firmwares/*.yaml` | user (via `scripts/package_ota.py`) | Human-facing metadata sidecar. Not read by firmware. |
 
 Card is ordinary FAT32, formatted with `diskutil eraseDisk FAT32 HELIOS MBRFormat /dev/diskN`.
+
+### Firmware library + tags
+
+Tagged firmware variants live in `/sd/firmwares/`, named `<name>-<tag>-<version>.signed.bin`. Tags are one of `debug`, `experimental`, `prod`. The tag in the filename is metadata (used by `POST /admin/boot-from-sd?tag=...` to pick the newest match). The tag *baked into the binary* at compile time is set via `-DFW_TAG=<tag>` in `platformio.ini` `build_flags` and drives the **prod-only auto-promote** behavior:
+
+> Only firmware with compiled `FW_TAG==prod` will promote `/sd/recovery.staging.bin` → `/sd/recovery.signed.bin` on `mark_valid`. Debug/experimental runs validate themselves (rollback still cancels) but leave the Tier-2 safety net untouched.
+
+This means your `recovery.signed.bin` always points at the last known-good *production* image. Debug builds can crash freely without ever degrading the fallback.
+
+### Packaging
+
+```bash
+python3 scripts/package_ota.py firmware.bin \
+    --name camera_ota --tag debug --version b5e7bc6 \
+    --out /tmp/helios-bins/staged/firmwares/
+# writes camera_ota-debug-b5e7bc6.signed.bin + .yaml
+```
+
+Then upload to the device's SD library:
+
+```bash
+curl --data-binary @camera_ota-debug-b5e7bc6.signed.bin \
+    "http://helios-cam.local/admin/upload-fw?name=camera_ota-debug-b5e7bc6.signed.bin"
+```
+
+Or copy to `/sd/firmwares/` directly via SD card reader.
 
 ## HTTP endpoints
 
@@ -83,6 +111,14 @@ All served on port 80 by the running main firmware.
 | `POST /wifi` | Replace `/sd/wifi.conf`. Body is new file contents. Reboot required to apply. |
 | `POST /reboot` | Unmount SD (for clean writes) + reboot. |
 | `POST /ota` | Flash a signed firmware image. Body is `firmware.signed.bin` (firmware + 32-byte HMAC tag). Rejects with 401 on bad signature. Reboots into new slot on success. |
+| `GET /admin/partitions` | JSON: running/boot partitions, `fw_tag` (compiled), per-slot state + app description. |
+| `GET /admin/firmwares` | JSON: list of `/sd/firmwares/*.signed.bin` with parsed name/tag/version from filename. |
+| `POST /admin/upload-fw?name=<basename>` | Write body to `/sd/firmwares/<basename>`. Basename must end in `.signed.bin`, no path separators. Signature is verified at boot-time, not upload-time. |
+| `POST /admin/boot-from-sd?file=<basename>` | Verify HMAC of `/sd/firmwares/<basename>`, flash into inactive slot, reboot. |
+| `POST /admin/boot-from-sd?tag=<debug\|experimental\|prod>` | Pick newest SD firmware with that tag, verify, flash, reboot. |
+| `POST /admin/boot-from-sd?...&force=1` | Plus `esp_ota_mark_app_valid_cancel_rollback()` preemptively (skip pending-verify safety — use only when you trust the target). |
+| `POST /admin/boot?slot=ota_0\|ota_1` | Flip boot partition to an already-loaded slot. No re-flash. |
+| `POST /admin/pin-recovery?file=<basename>` | Copy `/sd/firmwares/<basename>` → `/sd/recovery.signed.bin`. Manually anchor the Tier-2 safety net. |
 
 ## Signing
 

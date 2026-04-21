@@ -23,6 +23,10 @@
 #define BLE_PATH        "/sd/ble_recovery.signed.bin"
 #define BOOT_THRESHOLD  3
 
+#ifndef FW_TAG
+#define FW_TAG "debug"
+#endif
+
 static int nvs_get_counter(void)
 {
     nvs_handle_t h;
@@ -45,6 +49,8 @@ static void nvs_set_counter(int v)
 /* Copy a signed .bin (firmware + 32-byte sig) into the inactive OTA
  * partition, after verifying the HMAC. Returns ESP_OK if the new slot
  * is ready to boot. Caller should then set_boot_partition + restart. */
+esp_err_t recovery_apply_signed_file(const char *sd_path,
+                                     const esp_partition_t **out_slot);
 static esp_err_t apply_signed_bin_to_inactive_slot(const char *sd_path,
                                                    const esp_partition_t **out_slot)
 {
@@ -146,6 +152,12 @@ esp_err_t recovery_boot_check(void)
     return ESP_OK;   /* not reached */
 }
 
+esp_err_t recovery_apply_signed_file(const char *sd_path,
+                                     const esp_partition_t **out_slot)
+{
+    return apply_signed_bin_to_inactive_slot(sd_path, out_slot);
+}
+
 esp_err_t recovery_pivot_to_ble(void)
 {
     if (!sd_card_is_mounted()) {
@@ -184,14 +196,22 @@ esp_err_t recovery_mark_app_valid(void)
     nvs_set_counter(0);
 
     /* Promote the staging recovery blob (written during the last OTA POST)
-     * to the canonical recovery file. This keeps /sd/recovery.signed.bin
-     * pointing at the latest known-good image. */
-    if (sd_card_exists(RECOVERY_STAGE)) {
-        if (sd_card_rename(RECOVERY_STAGE, RECOVERY_PATH)) {
-            DLOG("[RECOVERY] promoted staging to %s\n", RECOVERY_PATH);
-        } else {
-            DLOG("[RECOVERY] failed to promote staging — keeping old recovery\n");
+     * to the canonical recovery file ONLY if this running firmware is
+     * tagged "prod". Debug/experimental runs don't overwrite the prod
+     * safety net — recovery.signed.bin stays anchored to the last
+     * known-good production image. */
+    if (strcmp(FW_TAG, "prod") == 0) {
+        if (sd_card_exists(RECOVERY_STAGE)) {
+            if (sd_card_rename(RECOVERY_STAGE, RECOVERY_PATH)) {
+                DLOG("[RECOVERY] prod build — promoted staging to %s\n", RECOVERY_PATH);
+            } else {
+                DLOG("[RECOVERY] failed to promote staging — keeping old recovery\n");
+            }
         }
+    } else {
+        DLOG("[RECOVERY] tag=%s (not prod) — not touching recovery.signed.bin\n", FW_TAG);
+        /* Clean up the staging file so it doesn't sit forever on SD. */
+        if (sd_card_exists(RECOVERY_STAGE)) sd_card_unlink(RECOVERY_STAGE);
     }
     return ESP_OK;
 }

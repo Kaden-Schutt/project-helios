@@ -26,3 +26,10 @@ esp_err_t recovery_mark_app_valid(void);
  * fails to find any known SSID — jumps us into Tier-3 BLE rescue mode.
  * Returns ESP_ERR_NOT_FOUND (and does nothing) if the file isn't on SD. */
 esp_err_t recovery_pivot_to_ble(void);
+
+/* Public helper: verify a signed .bin on SD and flash into the inactive
+ * OTA slot. Caller is responsible for esp_ota_set_boot_partition +
+ * esp_restart afterwards (admin.c does this). */
+#include "esp_partition.h"
+esp_err_t recovery_apply_signed_file(const char *sd_path,
+                                     const esp_partition_t **out_slot);

@@ -30,6 +30,7 @@
 #include "ota_verify.h"
 #include "ota_pubkey.h"
 #include "sd_card.h"
+#include "admin.h"
 
 static const char *TAG = "ota";
 static httpd_handle_t s_server = NULL;
@@ -493,6 +494,7 @@ esp_err_t ota_http_start(void)
     httpd_register_uri_handler(s_server, &wifi_get);
     httpd_register_uri_handler(s_server, &wifi_post);
     httpd_register_uri_handler(s_server, &reboot);
+    admin_register(s_server);
 
     ESP_LOGI(TAG, "OTA HTTP listening on :80  "
              "(GET /info /logs /frame /button /mic, POST /ota)");
