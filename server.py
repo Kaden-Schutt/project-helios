@@ -312,10 +312,24 @@ async def photo_upload(request: Request):
     try:
         with open(f"{PHOTO_DIR}/{ts}.jpg", "wb") as f: f.write(raw)
         with open(f"{PHOTO_DIR}/latest.jpg", "wb") as f: f.write(raw)
+        # Also save the exact bytes Haiku will see, so we can eyeball what
+        # the VLM actually got when behavior looks off.
+        with open(f"{PHOTO_DIR}/latest_haiku.jpg", "wb") as f: f.write(resized)
     except Exception as e:
         log.warning(f"[PHOTO] save: {e}")
     log.info(f"[PHOTO] {len(raw):,}B raw → {len(resized):,}B resized valid={valid}")
     return {"status": "ok", "size": len(raw), "resized": len(resized)}
+
+
+@app.get("/photo/latest-haiku")
+async def photo_latest_haiku():
+    """Return the exact JPEG that was last base64-encoded for Haiku — useful
+    to diff against /photo/latest when debugging hallucinations."""
+    path = f"{PHOTO_DIR}/latest_haiku.jpg"
+    if not os.path.exists(path):
+        return Response(status_code=404)
+    with open(path, "rb") as f:
+        return Response(content=f.read(), media_type="image/jpeg")
 
 
 @app.get("/photo/latest")
@@ -327,56 +341,114 @@ async def photo_latest():
         return Response(content=f.read(), media_type="image/jpeg")
 
 
+_query_lock = asyncio.Lock()
+
+
+async def _speak_fallback(text: str):
+    """Fire-and-forget: synthesize + play a short spoken error. Separate so a
+    TTS failure in the main pipeline can still produce SOME spoken feedback
+    via this function with a different call context."""
+    try:
+        pcm = await tts_synthesize(text)
+        if pcm:
+            await _play_tts(pcm)
+    except Exception as e:
+        log.error(f"[FALLBACK] {e}")
+
+
 @app.post("/query")
 async def handle_query(request: Request):
     """Accepts either:
     - Content-Type: application/json  → {"image": b64, "audio": b64, "transcript": str}
     - anything else (audio/L16 etc.)  → raw PCM s16le 16 kHz body; JPEG from last /photo/upload
-    """
-    global _last_jpeg_b64
-    t0 = time.time()
-    ctype = request.headers.get("content-type", "")
-    if "json" in ctype:
-        body = await request.json()
-        image_b64 = body.get("image", "")
-        audio = base64.b64decode(body["audio"]) if body.get("audio") else b""
-        transcript = body.get("transcript", "")
-    else:
-        audio = await request.body()
-        image_b64 = _last_jpeg_b64 or ""
-        _last_jpeg_b64 = None
-        transcript = ""
 
-    log.info("=" * 60)
-    log.info(f"[QUERY] audio={len(audio):,}B image={'yes' if image_b64 else 'no'} "
-             f"transcript={'given' if transcript else 'stt'}")
+    Serialized via _query_lock so a double-tap can't double-bill the pipeline.
+    Each stage is wrapped in try/except so the user always hears a spoken
+    response — if anything breaks, we say so instead of going silent."""
+    if _query_lock.locked():
+        log.warning("[QUERY] already in flight — dropping duplicate")
+        return JSONResponse({"error": "busy"}, status_code=429)
 
-    if not transcript:
-        transcript = await stt_transcribe(audio)
-    if not transcript.strip():
-        transcript = "What's in front of me?"
-        log.warning(f"[QUERY] empty transcript, fallback {transcript!r}")
+    async with _query_lock:
+        global _last_jpeg_b64
+        t0 = time.time()
+        ctype = request.headers.get("content-type", "")
+        if "json" in ctype:
+            body = await request.json()
+            image_b64 = body.get("image", "")
+            audio = base64.b64decode(body["audio"]) if body.get("audio") else b""
+            transcript = body.get("transcript", "")
+        else:
+            audio = await request.body()
+            image_b64 = _last_jpeg_b64 or ""
+            _last_jpeg_b64 = None
+            transcript = ""
 
-    reply = await vision_query(transcript, image_b64)
-    pcm = await tts_synthesize(reply)
-    await _play_tts(pcm)
+        log.info("=" * 60)
+        log.info(f"[QUERY] audio={len(audio):,}B image={'yes' if image_b64 else 'no'} "
+                 f"transcript={'given' if transcript else 'stt'}")
 
-    total_ms = (time.time() - t0) * 1000
-    log.info(f"[QUERY] done in {total_ms:.0f}ms")
+        # Stage 1: STT — if it fails or is empty, keep going with a fallback
+        # transcript so the user still gets a reply grounded in the image.
+        if not transcript:
+            try:
+                transcript = await stt_transcribe(audio)
+            except Exception as e:
+                log.error(f"[QUERY] STT raised: {e}")
+                transcript = ""
+        if not transcript.strip():
+            if not audio or len(audio) < 3200:
+                reply = "I didn't catch that. Try holding the button a bit longer."
+                log.warning(f"[QUERY] audio too short, speaking fallback")
+                pcm = b""
+                try:
+                    pcm = await tts_synthesize(reply)
+                    await _play_tts(pcm)
+                except Exception as e:
+                    log.error(f"[QUERY] fallback TTS: {e}")
+                return Response(content=pcm, media_type="application/octet-stream",
+                                headers={"X-Response-Text": reply[:500]})
+            transcript = "What's in front of me?"
+            log.warning(f"[QUERY] empty transcript, fallback {transcript!r}")
 
-    def _latin1(s: str) -> str:
-        return s.encode("latin-1", "replace").decode("latin-1")
+        # Stage 2: vision LLM
+        try:
+            reply = await vision_query(transcript, image_b64)
+        except Exception as e:
+            log.error(f"[QUERY] LLM raised: {e}")
+            reply = "Sorry, I had trouble processing that. Try again?"
 
-    return Response(
-        content=pcm,
-        media_type="application/octet-stream",
-        headers={
-            "X-Transcript":    _latin1(transcript[:500]),
-            "X-Response-Text": _latin1(reply[:500]),
-            "X-Sample-Rate":   str(TTS_SAMPLE_RATE),
-            "X-Encoding":      TTS_ENCODING,
-        },
-    )
+        # Stage 3: TTS + playback (best-effort; log failures loudly so they're
+        # visible in journalctl, but don't raise into the HTTP response).
+        pcm = b""
+        try:
+            pcm = await tts_synthesize(reply)
+        except Exception as e:
+            log.error(f"[QUERY] TTS raised: {e}")
+        if pcm:
+            try:
+                await _play_tts(pcm)
+            except Exception as e:
+                log.error(f"[QUERY] play raised: {e}")
+        else:
+            log.warning("[QUERY] empty TTS — nothing played")
+
+        total_ms = (time.time() - t0) * 1000
+        log.info(f"[QUERY] done in {total_ms:.0f}ms")
+
+        def _latin1(s: str) -> str:
+            return s.encode("latin-1", "replace").decode("latin-1")
+
+        return Response(
+            content=pcm,
+            media_type="application/octet-stream",
+            headers={
+                "X-Transcript":    _latin1(transcript[:500]),
+                "X-Response-Text": _latin1(reply[:500]),
+                "X-Sample-Rate":   str(TTS_SAMPLE_RATE),
+                "X-Encoding":      TTS_ENCODING,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

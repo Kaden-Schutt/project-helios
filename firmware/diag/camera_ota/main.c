@@ -317,6 +317,12 @@ void app_main(void)
     int64_t boot = last_report;
 
     while (1) {
+        /* Yield the camera slot while a button-hold query is in flight so
+         * the single fb pointer isn't clobbered mid-POST. */
+        if (query_client_is_busy() || button_is_holding()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         uint8_t *buf = NULL;
         size_t len = 0;
         int64_t tc0 = esp_timer_get_time();

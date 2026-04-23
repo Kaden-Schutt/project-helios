@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -16,3 +17,9 @@
  * until hold_end. On release it POSTs a fresh JPEG to /photo/upload and the
  * recorded PCM to /query. Pi handles STT/LLM/TTS and plays audio locally. */
 esp_err_t query_client_init(void);
+
+/* True while query_client owns the camera: from the first post-hold frame
+ * flush through the final POST /query returning. Consumers like the 1 fps
+ * endurance loop in main.c should yield when this is true so the single
+ * esp-camera fb slot isn't contended. */
+bool query_client_is_busy(void);

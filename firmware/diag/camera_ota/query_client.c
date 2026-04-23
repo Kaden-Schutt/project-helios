@@ -19,9 +19,14 @@
 #include "mic_probe.h"
 #include "diag_log.h"
 
+#include <stdbool.h>
 #include <string.h>
 #include <math.h>
 #include <inttypes.h>
+
+static volatile bool s_busy = false;
+bool query_client_is_busy(void) { return s_busy; }
+
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -87,6 +92,7 @@ static void query_task(void *arg)
         }
 
         int64_t t0 = esp_timer_get_time();
+        s_busy = true;
         mic_probe_suspend();
         /* Flush any stale DMA samples accumulated while probe was running. */
         mic_helios_start();
@@ -130,6 +136,7 @@ static void query_task(void *arg)
 
         if (offset < CHUNK_BYTES) {
             DLOG("[QUERY] too short, skipping upload\n");
+            s_busy = false;
             continue;
         }
 
@@ -158,6 +165,7 @@ static void query_task(void *arg)
 
         int64_t t2 = esp_timer_get_time();
         DLOG("[QUERY] round-trip %lld ms total\n", (long long)((t2 - t0) / 1000));
+        s_busy = false;
     }
 }
 
