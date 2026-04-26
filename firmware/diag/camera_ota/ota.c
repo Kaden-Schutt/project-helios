@@ -108,20 +108,41 @@ static esp_err_t frame_get_handler(httpd_req_t *req)
 
 static esp_err_t button_get_handler(httpd_req_t *req)
 {
-    char body[192];
+    char body[512];
     uint32_t age = button_last_press_ms_ago();
     char age_buf[24];
     if (age == UINT32_MAX) snprintf(age_buf, sizeof(age_buf), "null");
     else                    snprintf(age_buf, sizeof(age_buf), "%lu", (unsigned long)age);
+
+    /* Drain up to 16 pending gesture events into a JSON array. */
+    char gestures[256];
+    int gi = 0;
+    gestures[gi++] = '[';
+    for (int i = 0; i < 16; i++) {
+        btn_gesture_t g = button_gesture_pop();
+        if (g == BTN_GESTURE_NONE) break;
+        if (i > 0 && gi < (int)sizeof(gestures) - 2) gestures[gi++] = ',';
+        int written = snprintf(gestures + gi, sizeof(gestures) - gi,
+                               "\"%s\"", button_gesture_name(g));
+        if (written <= 0 || written >= (int)sizeof(gestures) - gi) break;
+        gi += written;
+    }
+    if (gi < (int)sizeof(gestures) - 1) gestures[gi++] = ']';
+    gestures[gi] = '\0';
+
     int n = snprintf(body, sizeof(body),
         "{\n"
         "  \"pressed\": %s,\n"
+        "  \"holding\": %s,\n"
         "  \"presses_total\": %lu,\n"
-        "  \"last_press_ms_ago\": %s\n"
+        "  \"last_press_ms_ago\": %s,\n"
+        "  \"gestures\": %s\n"
         "}\n",
         button_is_pressed() ? "true" : "false",
+        button_is_holding() ? "true" : "false",
         (unsigned long)button_press_count(),
-        age_buf);
+        age_buf,
+        gestures);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
 }

@@ -9,9 +9,8 @@
 #        (including bluez + avahi-daemon explicitly — do NOT rely on
 #         DietPi software IDs which have silently failed on our tests)
 #      - dietpi-wifi.txt: 4 networks (Raspberry Pi, iPhone hotspot, home)
-#      - Automation_Custom_Script.sh: clones helios repo, builds/installs
-#        helios_ble, sets up systemd services (disabled by default)
-#      - helios_ble prebuilt wheel (from build server)
+#      - Automation_Custom_Script.sh: clones helios repo, installs Python
+#        deps, sets up helios-server systemd unit (disabled by default)
 #
 # Usage:
 #   ./prep-pi4b-sd.sh /dev/diskN   (macOS)
@@ -33,8 +32,6 @@ fi
 TARGET_DISK="$1"
 IMAGE_URL="https://dietpi.com/downloads/images/DietPi_RPi234-ARMv8-Bookworm.img.xz"
 IMAGE_CACHE="/tmp/dietpi-rpi4.img.xz"
-WHEEL_URL="https://github.com/Kaden-Schutt/project-helios/releases/latest/download/helios_ble-0.1.0-cp38-abi3-linux_aarch64.whl"
-WHEEL_CACHE="/tmp/helios_ble-0.1.0-cp38-abi3-linux_aarch64.whl"
 
 # Repo-local files we copy onto the FAT partition
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -130,14 +127,6 @@ if [[ -f "$AUTOMATION_SRC" ]]; then
     cp "$AUTOMATION_SRC" "$DIETPISETUP/Automation_Custom_Script.sh"
 fi
 
-# --- 6. Drop helios_ble wheel ---
-if [[ -f "$WHEEL_CACHE" ]]; then
-    log "Copying helios_ble wheel..."
-    cp "$WHEEL_CACHE" "$DIETPISETUP/"
-else
-    log "WARN: wheel not at $WHEEL_CACHE — first boot will fall back to source build"
-fi
-
 # Clean up macOS metadata files if we're on macOS
 if [[ "$(uname)" == "Darwin" ]]; then
     dot_clean -m "$DIETPISETUP" 2>/dev/null || true
@@ -158,4 +147,5 @@ log "Done. Insert SD into Pi 4B and power on."
 log "First boot takes ~5 min, then:"
 log "  ssh root@helios.local   (password: dietpi)"
 log "  scp .env root@helios.local:/root/project-helios/.env"
-log "  systemctl start helios-ble"
+log "  bluetoothctl   # pair + connect MT BT speaker"
+log "  systemctl start helios-server"

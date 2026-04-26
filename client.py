@@ -218,7 +218,7 @@ def main():
         r = requests.get(SERVER_URL.replace("/query", "/health"), timeout=5)
         health = r.json()
         print(f"  Server status: {health.get('status', '?')}")
-        for k in ("cartesia_key", "openrouter_key"):
+        for k in ("cartesia_key", "anthropic_key"):
             v = health.get(k, "?")
             status = "✓" if v == "set" else "✗ MISSING"
             print(f"    {k}: {status}")

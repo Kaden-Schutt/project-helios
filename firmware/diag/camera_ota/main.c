@@ -45,7 +45,8 @@
 #include "ota.h"
 #include "diag_log.h"
 #include "button.h"
-#include "mic_probe.h"
+#include "mic_helios.h"
+#include "query_client.h"
 #include "sd_card.h"
 #include "recovery.h"
 
@@ -285,9 +286,23 @@ void app_main(void)
          * from Tiers 1/2 will kick in on subsequent boots. */
     }
 
-    /* ---- Peripheral probes: button + mic ---- */
+    /* ---- Peripheral probes: button + mic ----
+     * We only init mic_helios (hardware); don't spawn the mic_probe
+     * RMS-sampler task — it contends with query_client over the single i2s
+     * DMA reader and makes our recording return 0 bytes. If you need /mic
+     * RMS for diagnostics, only enable it when query_client is NOT running. */
     button_init();
-    mic_probe_init();
+    mic_helios_init();
+    mic_helios_start();
+
+    /* ---- Button-hold query task ---- */
+    if (wer == ESP_OK) {
+        esp_err_t qer = query_client_init();
+        DLOG("[CAMDIAG] query_client_init -> 0x%x  (target %s)\n",
+             qer, HELIOS_PI_URL);
+    } else {
+        DLOG("[CAMDIAG] skip query_client — no WiFi\n");
+    }
 
     /* ---- Endurance loop: 1 fps, publish frames, 10s summary ---- */
     if (!camera_helios_is_ready()) {
@@ -302,6 +317,12 @@ void app_main(void)
     int64_t boot = last_report;
 
     while (1) {
+        /* Yield the camera slot while a button-hold query is in flight so
+         * the single fb pointer isn't clobbered mid-POST. */
+        if (query_client_is_busy() || button_is_holding()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         uint8_t *buf = NULL;
         size_t len = 0;
         int64_t tc0 = esp_timer_get_time();

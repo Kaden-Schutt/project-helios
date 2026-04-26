@@ -1,4 +1,9 @@
-#include "helios.h"
+/*
+ * Camera module for Helios WiFi test — OV2640 via DVP on XIAO ESP32S3 Sense.
+ * Adapted from firmware/src/camera.c (stripped of helios.h / BLE dependencies).
+ */
+
+#include "camera_helios.h"
 #include "esp_log.h"
 #include "esp_camera.h"
 #include "freertos/FreeRTOS.h"
@@ -6,8 +11,9 @@
 
 static const char *TAG = "cam";
 static camera_fb_t *s_fb = NULL;
+static bool s_ready = false;
 
-esp_err_t camera_init(void)
+esp_err_t camera_helios_init(void)
 {
     camera_config_t config = {
         .pin_pwdn     = CAM_PIN_PWDN,
@@ -32,8 +38,8 @@ esp_err_t camera_init(void)
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_VGA,      // 640x480
-        .jpeg_quality = 6,
+        .frame_size   = FRAMESIZE_HD,       // 1280x720
+        .jpeg_quality = 8,              // 0-63 (lower = better); 10 is a good tradeoff
         .fb_count     = 2,
         .fb_location  = CAMERA_FB_IN_PSRAM,
         .grab_mode    = CAMERA_GRAB_LATEST,
@@ -41,42 +47,45 @@ esp_err_t camera_init(void)
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "init failed: 0x%x", err);
+        ESP_LOGE(TAG, "init failed: 0x%x (%s)", err, esp_err_to_name(err));
         return err;
     }
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
         ESP_LOGI(TAG, "sensor PID: 0x%04x", s->id.PID);
-
-        // OV3660-specific tuning
         if (s->id.PID == 0x3660) {
-            ESP_LOGI(TAG, "Applying OV3660 JPEG fixes...");
+            // OV3660-specific JPEG tuning
             s->set_vflip(s, 1);
+            s->set_hmirror(s, 1);
             s->set_brightness(s, 1);
             s->set_saturation(s, -1);
             s->set_sharpness(s, 2);
         }
     }
 
-    // Warm up: discard first few frames (sensor needs time to auto-expose)
+    // Warm up — first couple frames are garbage while AGC/AWB settles
     for (int i = 0; i < 3; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            ESP_LOGI(TAG, "warmup frame %d: %zu bytes", i + 1, fb->len);
+            ESP_LOGI(TAG, "warmup frame %d: %zu bytes (%dx%d)",
+                     i + 1, fb->len, fb->width, fb->height);
             esp_camera_fb_return(fb);
         } else {
             ESP_LOGW(TAG, "warmup frame %d: timeout", i + 1);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
     }
 
-    ESP_LOGI(TAG, "camera ready (VGA JPEG Q6, OV%04x)", s ? s->id.PID : 0);
+    s_ready = true;
+    ESP_LOGI(TAG, "camera ready (VGA JPEG Q10, OV%04x)", s ? s->id.PID : 0);
     return ESP_OK;
 }
 
-esp_err_t camera_capture_jpeg(uint8_t **out_buf, size_t *out_len)
+esp_err_t camera_helios_capture(uint8_t **out_buf, size_t *out_len)
 {
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+
     if (s_fb) {
         esp_camera_fb_return(s_fb);
         s_fb = NULL;
@@ -90,13 +99,12 @@ esp_err_t camera_capture_jpeg(uint8_t **out_buf, size_t *out_len)
 
     *out_buf = s_fb->buf;
     *out_len = s_fb->len;
-
     ESP_LOGI(TAG, "captured %zu bytes fmt=%d (%dx%d)",
              s_fb->len, s_fb->format, s_fb->width, s_fb->height);
     return ESP_OK;
 }
 
-void camera_return_fb(void)
+void camera_helios_return_fb(void)
 {
     if (s_fb) {
         esp_camera_fb_return(s_fb);
@@ -104,12 +112,17 @@ void camera_return_fb(void)
     }
 }
 
-void camera_deinit(void)
+void camera_helios_deinit(void)
 {
-    if (s_fb) {
-        esp_camera_fb_return(s_fb);
-        s_fb = NULL;
+    camera_helios_return_fb();
+    if (s_ready) {
+        esp_camera_deinit();
+        s_ready = false;
+        ESP_LOGI(TAG, "camera deinit");
     }
-    esp_camera_deinit();
-    ESP_LOGI(TAG, "camera deinitialized");
+}
+
+bool camera_helios_is_ready(void)
+{
+    return s_ready;
 }

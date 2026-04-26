@@ -1,44 +1,35 @@
 #!/usr/bin/env bash
-# Helios board bootstrap — works on Raspberry Pi OS Lite (Bookworm/Trixie)
-# and Armbian for OrangePi Zero 2W. Idempotent: safe to re-run.
+# Helios board bootstrap — Raspberry Pi OS Lite (Bookworm/Trixie). Idempotent.
 #
 # What it does:
-#   1. Installs system packages (libopus, libdbus-dev, python3-venv, rust)
-#   2. Configures bluez ExchangeMTU = 517 (ATT MTU negotiation enabled)
-#   3. Clones or updates the Helios repo
-#   4. Creates a Python venv and installs deps
-#   5. Builds the helios_ble Rust extension via maturin
-#   6. Installs and enables the helios-ble + rear_safety systemd services
+#   1. Installs system packages (libopus, bluez, python3-venv)
+#   2. Clones or updates the Helios repo
+#   3. Creates a Python venv and installs deps
+#   4. Installs + enables helios-server (WiFi HTTP) and rear_safety systemd units
+#
+# The Pi owns the BT link to the MT speaker via system bluez; pendant talks to
+# the Pi over WiFi HTTP. BLE is used only as an OTA rescue path to the pendant
+# (scripts/ble_ota.py, which is why bleak is in the venv).
 #
 # Run: curl -fsSL <url>/setup.sh | bash
 # or:  cd /home/pi/project-helios && bash scripts/setup.sh
 
 set -euo pipefail
 
-# --- Config ---
 HELIOS_REPO="https://github.com/Kaden-Schutt/project-helios.git"
 HELIOS_BRANCH="main"
-HELIOS_DIR="/home/pi/project-helios"
-# Keep ownership + services running under the pi user even on Armbian where
-# the default user is 'orangepi' — remap if needed.
 TARGET_USER="${HELIOS_USER:-pi}"
 
-# --- Pre-flight ---
 if [[ $EUID -ne 0 ]]; then
     echo "This script needs root (sudo). Re-running with sudo..."
     exec sudo -E bash "$0" "$@"
 fi
 
-# Use whatever user actually exists. Armbian OrangePi images ship with
-# 'orangepi' by default; Pi OS ships with 'pi'. Fall back gracefully.
 if ! id "$TARGET_USER" &>/dev/null; then
     if id pi &>/dev/null; then
         TARGET_USER=pi
-    elif id orangepi &>/dev/null; then
-        TARGET_USER=orangepi
-        HELIOS_DIR="/home/orangepi/project-helios"
     else
-        echo "No pi or orangepi user found. Set HELIOS_USER env var." >&2
+        echo "No pi user found. Set HELIOS_USER env var." >&2
         exit 1
     fi
 fi
@@ -47,40 +38,21 @@ HELIOS_DIR="$USER_HOME/project-helios"
 
 echo "== Helios setup =="
 echo "User:       $TARGET_USER"
-echo "Home:       $USER_HOME"
 echo "Repo dir:   $HELIOS_DIR"
 echo
 
 # --- 1. System packages ---
-echo "[1/6] Installing apt packages..."
+echo "[1/4] Installing apt packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y \
     git curl build-essential pkg-config \
-    libopus-dev libdbus-1-dev libssl-dev \
+    libopus-dev libssl-dev \
     python3 python3-venv python3-dev python3-pip \
-    bluez bluetooth \
-    rustc cargo
+    bluez bluetooth bluez-alsa-utils
 
-# --- 2. bluez MTU configuration ---
-echo "[2/6] Configuring bluez ATT MTU..."
-BLUEZ_CONF="/etc/bluetooth/main.conf"
-if [[ -f "$BLUEZ_CONF" ]]; then
-    if grep -q "^#ExchangeMTU" "$BLUEZ_CONF"; then
-        sed -i 's/^#ExchangeMTU.*/ExchangeMTU = 517/' "$BLUEZ_CONF"
-    elif ! grep -q "^ExchangeMTU" "$BLUEZ_CONF"; then
-        # Insert under [GATT] section if present, else append
-        if grep -q "^\[GATT\]" "$BLUEZ_CONF"; then
-            sed -i '/^\[GATT\]/a ExchangeMTU = 517' "$BLUEZ_CONF"
-        else
-            printf "\n[GATT]\nExchangeMTU = 517\n" >> "$BLUEZ_CONF"
-        fi
-    fi
-    systemctl restart bluetooth
-fi
-
-# --- 3. Clone or update repo ---
-echo "[3/6] Cloning Helios repo..."
+# --- 2. Clone or update repo ---
+echo "[2/4] Cloning Helios repo..."
 if [[ ! -d "$HELIOS_DIR/.git" ]]; then
     sudo -u "$TARGET_USER" git clone --branch "$HELIOS_BRANCH" "$HELIOS_REPO" "$HELIOS_DIR"
 else
@@ -88,8 +60,8 @@ else
     sudo -u "$TARGET_USER" git -C "$HELIOS_DIR" reset --hard "origin/$HELIOS_BRANCH" || true
 fi
 
-# --- 4. Python venv + deps ---
-echo "[4/6] Setting up Python venv..."
+# --- 3. Python venv + deps ---
+echo "[3/4] Setting up Python venv..."
 sudo -u "$TARGET_USER" bash <<EOF
 set -e
 cd "$HELIOS_DIR"
@@ -98,39 +70,30 @@ if [[ ! -d .venv ]]; then
 fi
 .venv/bin/pip install --upgrade pip wheel
 .venv/bin/pip install \
-    bleak opuslib httpx websockets python-dotenv \
-    anthropic numpy fastapi uvicorn maturin
+    httpx websockets python-dotenv \
+    anthropic numpy fastapi uvicorn \
+    bleak opuslib
 EOF
 
-# --- 5. Build helios_ble Rust extension ---
-echo "[5/6] Building helios_ble Rust extension (this takes a few minutes)..."
-sudo -u "$TARGET_USER" bash <<EOF
-set -e
-cd "$HELIOS_DIR/rust/helios_ble"
-source "$HELIOS_DIR/.venv/bin/activate"
-maturin develop --release
-EOF
+# --- 4. systemd services + reachability ---
+echo "[4/4] Installing systemd units + reachability layer..."
 
-# --- 6. systemd services + reachability ---
-echo "[6/6] Installing systemd services + reachability layer..."
-
-# WiFi import helper — reads /boot/firmware/wifi.conf at boot.
-# Lets you swap WiFi credentials by editing a FAT32 file from any OS.
+# WiFi import helper — reads /boot/firmware/wifi.conf at boot so credentials
+# can be swapped from any OS by editing a FAT32 file.
 if [[ -f "$HELIOS_DIR/scripts/helios-wifi-import.sh" ]]; then
     install -m 755 "$HELIOS_DIR/scripts/helios-wifi-import.sh" /usr/local/sbin/
     install -m 644 "$HELIOS_DIR/scripts/helios-wifi-import.service" /etc/systemd/system/
     systemctl enable helios-wifi-import.service
 fi
 
-# Reachability: avahi (mDNS), tailscale (cross-network), ssh always-on.
-# Pass TAILSCALE_AUTHKEY env var to auto-auth tailscale headlessly.
+# avahi (mDNS), tailscale (cross-network), ssh.
 if [[ -f "$HELIOS_DIR/scripts/helios-reachable.sh" ]]; then
     bash "$HELIOS_DIR/scripts/helios-reachable.sh"
 fi
 
-cat > /etc/systemd/system/helios-ble.service <<EOF
+cat > /etc/systemd/system/helios-server.service <<EOF
 [Unit]
-Description=Helios BLE Voice + Vision Server
+Description=Helios Voice + Vision Server (WiFi HTTP)
 After=bluetooth.target network-online.target
 Wants=bluetooth.target
 
@@ -138,7 +101,7 @@ Wants=bluetooth.target
 Type=simple
 User=$TARGET_USER
 WorkingDirectory=$HELIOS_DIR
-ExecStart=$HELIOS_DIR/.venv/bin/python server_ble.py
+ExecStart=$HELIOS_DIR/.venv/bin/python server.py
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
@@ -147,9 +110,7 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-# Rear safety only if the file exists
 if [[ -f "$HELIOS_DIR/rear_safety.py" ]]; then
-    cp "$HELIOS_DIR/rear_safety.service" /etc/systemd/system/ 2>/dev/null || \
     cat > /etc/systemd/system/rear_safety.service <<EOF
 [Unit]
 Description=Helios Rear Safety Loop
@@ -170,13 +131,14 @@ EOF
 fi
 
 systemctl daemon-reload
-systemctl enable helios-ble.service
+systemctl enable helios-server.service
 
 echo
 echo "== Setup complete =="
 echo
 echo "Next steps:"
-echo "  1. Place your .env file at $HELIOS_DIR/.env (CARTESIA_API_KEY, ANTHROPIC_API_KEY)"
-echo "  2. Start services: systemctl start helios-ble rear_safety"
-echo "  3. Watch logs:     journalctl -u helios-ble -f"
+echo "  1. Place .env at $HELIOS_DIR/.env (CARTESIA_API_KEY, ANTHROPIC_API_KEY)"
+echo "  2. Pair MT speaker: bluetoothctl → scan, pair, trust, connect"
+echo "  3. Start services:  systemctl start helios-server rear_safety"
+echo "  4. Watch logs:      journalctl -u helios-server -f"
 echo
